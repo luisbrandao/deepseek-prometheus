@@ -225,6 +225,7 @@ Set in `docker-compose.yml` — **not** in `config.yaml`:
 | `RESOLVE_CLIENT_HOST` | `true` | Reverse-DNS the caller IP for the request log (cached, off-loop, time-bounded) |
 | `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for a reverse-DNS lookup before logging IP-only |
 | `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For` / `X-Real-IP` for the caller IP (set `false` behind no proxy) |
+| `INFLIGHT_HISTORY` | `200` | Finished requests the In-flight tab keeps below the live ones (in-memory, lost on restart) |
 
 > **Single worker required.** Slot/queue accounting is in-process, so run **one**
 > uvicorn worker (the default). Multiple workers would split the accounting and break
@@ -265,7 +266,8 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
 | `/ui/` | `GET` | Web console (Logging / In-flight / Models / Routing). Static, served by the proxy |
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
-| `/admin/inflight` | `GET` | Snapshot of every request in flight (running + queued) with per-provider slot occupancy |
+| `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
+| `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
 | `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
@@ -283,14 +285,43 @@ A built-in, dependency-free dashboard served by the proxy itself — open
 
 - **Logging** — live log tail (level filter, pause, autoscroll) plus the
   `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
-- **In-flight** — what the proxy is doing *right now*, polled every second: one row per
-  request, **queued ones first**. A running row shows the backend it landed on, the native
-  model id, and (for streams) a live chunk counter; a queued row shows the backends it is
-  waiting on and how long it has waited. Each row carries age / queued-for / running-for
-  timers, request body size, and who called (service from the `User-Agent`, plus IP and
-  reverse-DNS name). The toolbar totals running vs. queued and shows each provider's
-  `in_use/slots`, highlighted amber when full — so a growing queue can be read straight
-  against the capacity that is causing it. See [Slots, priority & queueing](#slots-priority--queueing).
+- **In-flight** — what the proxy is doing *right now*, polled every second, as a rolling
+  feed: **live requests pinned on top** (newest first), then the recently finished ones
+  below a divider. Every row is numbered with the request id.
+  - A **running** row shows the backend it landed on, the native model id, and — for
+    streams — a chunk counter that ticks as tokens arrive. A **queued** row shows which
+    backends it is waiting on and for how long. Both carry age / queued-for / running-for.
+  - A **finished** row is frozen at completion with its status, total time, queue wait and
+    token counts (`done` / `cancelled` / `failed`, colour-coded). History is capped by
+    `INFLIGHT_HISTORY` and is lost on restart by design — the durable per-request record is
+    the `event=request` log line.
+  - Every row shows who called (service from the `User-Agent`, plus IP and reverse-DNS name)
+    and the request body size.
+  - **Kill** cancels a live request — two clicks, since rows reorder as state changes. Works
+    on a queued request *and* on one wedged in an upstream read that will never return; the
+    slot is freed immediately and the caller gets a `503`. See
+    [Killing a request](#killing-a-request).
+  - The toolbar totals running / queued / done and shows each provider's `in_use/slots`,
+    amber when full — so a growing queue reads straight against the capacity causing it.
+    See [Slots, priority & queueing](#slots-priority--queueing).
+
+#### Killing a request
+
+The **Kill** button cancels the asyncio task serving that request, which unwinds the
+ordinary cleanup path: the slot is released, the upstream connection closed, and the
+request moves into the history as `cancelled`. Cancellation rather than a flag, because
+the requests worth killing are blocked inside an `await` — a queued one inside the slot
+Condition, a running one inside an upstream read that may never return.
+
+What the caller sees depends on how far the request got:
+
+- **Queued, or a buffered (non-streaming) response** — a clean `503` with
+  `{"error": {"type": "cancelled"}}`, the same shape as a queue timeout.
+- **Mid-stream** — the SSE stream simply ends. The `200` was committed with the first
+  chunk, so there is no status code left to send; the client sees a truncated completion
+  and a normal end of body.
+
+Each kill is logged at `WARNING` with the request id, model, backend and elapsed time.
 - **Models** — the aggregated catalog, plus a **Probe upstreams** button that queries
   each backend's real `/v1/models` so every endpoint's full list is visible at once
   (independent of `enabled_models`).

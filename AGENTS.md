@@ -18,7 +18,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission (round-robin within a tie tier) + queue via a lazily-created `asyncio.Condition`. |
-| `app/inflight.py` | Live registry of in-flight requests: `begin()` per request, `Entry.wait/run/chunk/finish`, `snapshot()`. Backs the console's In-flight tab. Observation only — nothing in the request path reads it. |
+| `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, and `Entry.cancel()` for the Kill button. Observation only apart from `cancel` — nothing in the *request path* reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
@@ -92,11 +92,24 @@ decompresses the response. Single process, async, one uvicorn worker.
 - **In-flight registry (`inflight.py`) has exactly one closer per entry.** `proxy_request`
   opens the entry and closes it for every response *except* a `StreamingResponse` — that
   one is still in flight when the handler returns, so `_handle_stream`'s generator closes
-  it in its `finally` (first statement, before any `await`, so a raising await can't leave
-  a phantom row). `finish()` is idempotent. Mirror the slot-release rule: if you add a code
-  path, guarantee the entry is closed on every exit including errors and client disconnect.
-  Keep it write-only from the request path — never let admission, routing or failover read
-  it, or an observability bug becomes a routing bug.
+  it in its `finally`, in the leading sync block before any `await` (a raising await must
+  not leave a phantom live row). `record()` before `finish()`, or the history row loses its
+  status and token counts. `finish()` is idempotent — removal from `_active` is the guard,
+  so a request can never appear twice in the feed. Mirror the slot-release rule: if you add
+  a code path, guarantee the entry is closed on every exit including errors, cancellation
+  and client disconnect. Keep it write-only from the request path — never let admission,
+  routing or failover read it, or an observability bug becomes a routing bug.
+- **Cancellation must not strand a slot.** The Kill button cancels the task serving a
+  request, so `CancelledError` can now surface at *any* `await` in the request path —
+  including ones that previously only ever saw `httpx.RequestError`. `_dispatch` therefore
+  releases the slot in an `except asyncio.CancelledError` branch (the non-stream path has
+  no `finally`, and for a stream the generator that owns the release never ran), and the
+  stream pre-flight closes its client on `BaseException`. Any new await that holds a slot
+  needs the same treatment. Cancellation prefers `Entry.stream_task` (bound inside the SSE
+  generator) over the request task: Starlette runs a streaming body in a child task while
+  the request task waits on client disconnect, so cancelling the latter mid-stream unwinds
+  through Starlette's disconnect listener and uvicorn logs a spurious "Exception in ASGI
+  application" traceback for a deliberate action.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
   cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
   or the histogram. Persistence must never crash startup or a request — failures are logged

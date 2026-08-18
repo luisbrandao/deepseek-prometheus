@@ -287,6 +287,11 @@ RESOLVE_CLIENT_HOST = _flag("RESOLVE_CLIENT_HOST", "true")
 CLIENT_DNS_TIMEOUT = float(os.environ.get("CLIENT_DNS_TIMEOUT", "1.0"))
 TRUST_PROXY_HEADERS = _flag("TRUST_PROXY_HEADERS", "true")
 
+# How many finished requests the In-flight tab keeps below the live ones. Purely
+# an in-memory ring buffer (like the log buffer) — it is lost on restart by
+# design; Loki has the durable copy of the per-request event log.
+INFLIGHT_HISTORY = int(os.environ.get("INFLIGHT_HISTORY", "200"))
+
 # Optional metric persistence: snapshot cumulative counters to disk and restore
 # them on boot so Prometheus deltas stay continuous across restarts. The path
 # must live on a volume that survives pod recreation to be useful.

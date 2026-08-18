@@ -205,6 +205,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 .flstat.run { color: var(--green); border-color: rgba(70,196,106,.4); }
 .flstat.queue { color: var(--muted); }
 .flstat.queue.hot { color: var(--amber); border-color: rgba(224,169,59,.5); background: rgba(224,169,59,.07); }
+.flstat.past { color: var(--muted); }
 
 .flslots { display: inline-flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
 .flslot {
@@ -223,16 +224,40 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   display: flex; align-items: center; gap: 14px;
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px;
   padding: 9px 13px;
-  border-left: 3px solid var(--green);
+  border-left: 3px solid var(--line-2);
 }
+/* A rail colour per state: the live ones assert themselves, history recedes. */
+.flrow.st-running { border-left-color: var(--green); }
 /* Queued rows are the ones worth noticing: amber rail + a faint wash. */
-.flrow.queued { border-left-color: var(--amber); background: rgba(224,169,59,.05); }
+.flrow.st-queued { border-left-color: var(--amber); background: rgba(224,169,59,.05); }
+.flrow.st-cancelled { border-left-color: var(--red); }
+.flrow.st-failed { border-left-color: var(--red); }
+/* Finished rows stay readable but stop competing with what's live. */
+.flrow.st-done, .flrow.st-cancelled, .flrow.st-failed { background: var(--bg); opacity: .78; }
+.flrow.st-done:hover, .flrow.st-cancelled:hover, .flrow.st-failed:hover { opacity: 1; }
 
+.flid {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+  min-width: 44px;
+}
 .flstate {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .7px; font-weight: 700;
-  color: var(--green); width: 58px; flex: 0 0 auto;
+  color: var(--muted); width: 66px; flex: 0 0 auto;
 }
-.flrow.queued .flstate { color: var(--amber); }
+.flrow.st-running .flstate { color: var(--green); }
+.flrow.st-queued .flstate { color: var(--amber); }
+.flrow.st-cancelled .flstate, .flrow.st-failed .flstate { color: var(--red); }
+
+/* Where "happening now" ends and the history begins. */
+.fldiv {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .8px;
+  color: var(--muted); margin: 4px 0 2px;
+}
+.fldiv::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+/* Keeps a finished row's columns aligned with the Kill button above it. */
+.flnokill { flex: 0 0 auto; width: 57px; }
 
 .flmain { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
 .flline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
@@ -243,6 +268,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   border-radius: 5px; padding: 1px 6px;
 }
 .fltag.warn { color: var(--amber); border-color: rgba(224,169,59,.45); }
+.fltag.bad { color: #ffb9af; border-color: rgba(229,96,77,.5); background: rgba(229,96,77,.10); }
 .flprov { font-weight: 600; color: var(--text); }
 .flnative { font-family: var(--mono); }
 .flwait { color: var(--amber); }
@@ -254,8 +280,21 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   min-width: 62px; background: var(--bg); border: 1px solid var(--line);
   border-radius: 6px; padding: 4px 7px;
 }
+.flrow.st-done .flcell, .flrow.st-cancelled .flcell, .flrow.st-failed .flcell { background: var(--bg-2); }
 .fllabel { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .flvalue { font-family: var(--mono); font-size: 12px; }
+
+/* Kill button: understated until armed, then unmistakably red. */
+.btn.kill {
+  flex: 0 0 auto; padding: 5px 11px; font-size: 12px;
+  border-color: var(--line-2); color: var(--muted);
+}
+.btn.kill:hover { color: #ffb9af; border-color: rgba(229,96,77,.55); background: rgba(229,96,77,.10); }
+.btn.kill.armed {
+  background: var(--red); border-color: var(--red); color: #fff; font-weight: 600;
+}
+.btn.kill.armed:hover { background: #f0705c; }
+.btn.kill:disabled { opacity: .6; color: var(--muted); background: var(--bg-3); }
 
 @media (max-width: 880px) {
   .flrow { flex-wrap: wrap; }

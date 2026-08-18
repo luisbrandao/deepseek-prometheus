@@ -314,11 +314,20 @@ async function probeUpstreams() {
 }
 
 /* ── In-flight ─────────────────────────────────────────────── */
-/* Polls /admin/inflight and re-renders the whole list each tick. Rows are
- * keyed by request id so the DOM is patched rather than rebuilt — otherwise a
- * 1s rebuild would fight text selection and flicker the timers. */
+/* Polls /admin/inflight and renders a rolling feed: live requests pinned on top
+ * (newest first), then the finished history below. Rows are keyed by request id
+ * and patched in place — a rebuild every second would fight text selection, and
+ * with a few hundred history rows it would also be wasteful. A row only
+ * re-renders when its data actually changed, so finished rows are drawn once and
+ * then left alone; only the live ones tick. */
 let flightTimer = null;
 const flightRows = new Map(); // id -> row element
+// Kill needs two clicks: rows re-render every second and reorder as requests
+// change state, so a single-click kill is one stray click away from killing
+// someone's generation. Armed ids live here so the state survives a re-render.
+const killArmed = new Set();
+const killSent = new Set();
+let flightDivider = null;
 
 function startFlightPolling() {
   if (flightTimer) return;
@@ -370,7 +379,9 @@ function renderFlight(data) {
   sum.append(
     el("span", "flstat run", running + " running"),
     el("span", "flstat queue" + (queued ? " hot" : ""), queued + " queued"),
+    el("span", "flstat past", (data.history || 0) + " done"),
   );
+  sum.lastChild.title = `rolling history, newest first — keeps the last ${data.history_limit} and is lost on restart`;
 
   // Per-provider occupancy: the capacity that decides whether the queue drains.
   const slotsWrap = $("#fl-slots");
@@ -387,15 +398,12 @@ function renderFlight(data) {
   const reqs = data.requests || [];
   if (!reqs.length) {
     flightRows.clear();
-    body.innerHTML = '<div class="notice">Nothing in flight.</div>';
+    killArmed.clear();
+    killSent.clear();
+    flightDivider = null;
+    body.innerHTML = '<div class="notice">Nothing in flight yet — requests appear here as they arrive.</div>';
     return;
   }
-  // Queued first — those are the ones you opened this tab to look at — then
-  // running, each group oldest-first (the API already returns arrival order).
-  const ordered = [
-    ...reqs.filter((r) => r.state === "queued"),
-    ...reqs.filter((r) => r.state !== "queued"),
-  ];
 
   if (!body.querySelector(".fllist")) {
     body.innerHTML = "";
@@ -403,29 +411,72 @@ function renderFlight(data) {
   }
   const list = body.querySelector(".fllist");
 
+  // The API already orders these: live newest-first, then the frozen history.
+  const firstDone = reqs.findIndex((r) => !r.live);
+  const items = [];
+  reqs.forEach((r, i) => {
+    // A divider marks where "happening now" ends, but only when both halves exist.
+    if (i === firstDone && firstDone > 0) items.push(null);
+    items.push(r);
+  });
+
   const seen = new Set();
-  ordered.forEach((r, i) => {
-    seen.add(r.id);
-    let row = flightRows.get(r.id);
-    if (!row) {
-      row = el("div", "flrow");
-      flightRows.set(r.id, row);
+  items.forEach((r, i) => {
+    let node;
+    if (r === null) {
+      if (!flightDivider) flightDivider = el("div", "fldiv", "recent");
+      node = flightDivider;
+    } else {
+      seen.add(r.id);
+      node = flightRows.get(r.id);
+      if (!node) {
+        node = el("div", "flrow");
+        flightRows.set(r.id, node);
+      }
+      fillFlightRow(node, r);
     }
-    fillFlightRow(row, r);
-    // Keep DOM order in sync with the sorted list.
-    if (list.children[i] !== row) list.insertBefore(row, list.children[i] || null);
+    // Keep DOM order in sync with the ordered list.
+    if (list.children[i] !== node) list.insertBefore(node, list.children[i] || null);
   });
   for (const [id, row] of flightRows) {
-    if (!seen.has(id)) { row.remove(); flightRows.delete(id); }
+    if (!seen.has(id)) {
+      row.remove();
+      flightRows.delete(id);
+      killArmed.delete(id);
+      killSent.delete(id);
+    }
   }
+  if (flightDivider && !items.includes(null)) { flightDivider.remove(); flightDivider = null; }
+}
+
+// Everything a row displays, in one string. Unchanged signature => skip the
+// re-render, which is what keeps a long history cheap to poll over.
+function flightSig(r) {
+  return [
+    r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
+    r.provider, r.attempt, r.in_tokens, r.out_tokens, r.client_host,
+    killArmed.has(r.id), killSent.has(r.id),
+  ].join("\u0001");
 }
 
 function fillFlightRow(row, r) {
-  const queued = r.state === "queued";
-  row.className = "flrow " + (queued ? "queued" : "running");
+  const sig = flightSig(r);
+  if (row._sig === sig) { row._r = r; return; }
+  row._sig = sig;
+  // Stash the latest snapshot so the disarm timer can re-render this row without
+  // waiting for (or forcing) another poll.
+  row._r = r;
+
+  row.className = "flrow st-" + r.state;
   row.innerHTML = "";
 
-  row.appendChild(el("span", "flstate", queued ? "queued" : "running"));
+  const idCell = el("span", "flid", "#" + r.id);
+  idCell.title = "request id · arrived " + r.arrived_at;
+  row.appendChild(idCell);
+
+  const state = el("span", "flstate", r.state);
+  if (r.status != null) state.title = "HTTP " + r.status;
+  row.appendChild(state);
 
   const main = el("div", "flmain");
   const line1 = el("div", "flline");
@@ -437,14 +488,22 @@ function fillFlightRow(row, r) {
     a.title = "failed over from an earlier backend";
     line1.appendChild(a);
   }
+  if (r.status != null && r.status >= 400) {
+    line1.appendChild(el("span", "fltag bad", "HTTP " + r.status));
+  }
   main.appendChild(line1);
 
   const line2 = el("div", "flline sub");
-  if (queued) {
+  if (r.state === "queued") {
     // What it is waiting on is the whole point of the queued view.
     line2.appendChild(el("span", "flwait", "waiting for: " + (r.candidates || []).join(", ")));
+  } else if (!r.provider) {
+    // Finished without ever being dispatched — killed in the queue, or rejected
+    // before a backend was picked. Naming the backends it wanted is the useful bit.
+    const c = (r.candidates || []).join(", ");
+    line2.appendChild(el("span", "flwait", "never reached a backend" + (c ? " · wanted " + c : "")));
   } else {
-    line2.appendChild(el("span", "flprov", r.provider || "—"));
+    line2.appendChild(el("span", "flprov", r.provider));
     if (r.native_model && r.native_model !== r.model) {
       line2.appendChild(el("span", "flnative", r.native_model));
     }
@@ -454,13 +513,71 @@ function fillFlightRow(row, r) {
   main.appendChild(line2);
   row.appendChild(main);
 
+  // Every row in a group gets the same cells — a stream-only column would make
+  // the numbers jump left and right down the list.
   const times = el("div", "fltimes");
-  times.appendChild(timeCell("age", dur(r.age)));
-  times.appendChild(timeCell("queued", dur(r.queued_for)));
-  times.appendChild(timeCell("running", dur(r.running_for)));
-  if (r.stream) times.appendChild(timeCell("chunks", r.chunks == null ? "—" : String(r.chunks)));
+  if (r.live) {
+    times.appendChild(timeCell("age", dur(r.age)));
+    times.appendChild(timeCell("queued", dur(r.queued_for)));
+    times.appendChild(timeCell("running", dur(r.running_for)));
+  } else {
+    times.appendChild(timeCell("took", dur(r.duration)));
+    times.appendChild(timeCell("queued", dur(r.queued_for)));
+    times.appendChild(timeCell("tok in", r.in_tokens == null ? "—" : String(r.in_tokens)));
+    times.appendChild(timeCell("tok out", r.out_tokens == null ? "—" : String(r.out_tokens)));
+  }
+  times.appendChild(timeCell("chunks", r.stream ? String(r.chunks == null ? "—" : r.chunks) : "—"));
   times.appendChild(timeCell("body", bytes(r.req_bytes)));
   row.appendChild(times);
+
+  // Only a live request can be killed; a finished row keeps the column aligned.
+  if (!r.live) {
+    row.appendChild(el("span", "flnokill"));
+    return;
+  }
+
+  const armed = killArmed.has(r.id);
+  const sent = killSent.has(r.id) || r.cancelled;
+  const kill = el("button", "btn kill" + (armed ? " armed" : ""), sent ? "killing…" : armed ? "Sure?" : "Kill");
+  kill.disabled = sent;
+  kill.title = sent
+    ? "cancellation sent — the row turns into a 'cancelled' history entry once it unwinds"
+    : armed
+      ? "click again to cancel this request"
+      : "cancel this request — the client gets a 503";
+  kill.onclick = () => {
+    if (killArmed.has(r.id)) { killArmed.delete(r.id); killFlight(r.id); return; }
+    killArmed.add(r.id);
+    fillFlightRow(row, r);
+    // Disarm on its own, so a stray first click doesn't stay live indefinitely.
+    setTimeout(() => {
+      if (!killArmed.delete(r.id)) return;
+      const still = flightRows.get(r.id);
+      if (still && still._r) fillFlightRow(still, still._r);
+    }, 4000);
+  };
+  row.appendChild(kill);
+}
+
+async function killFlight(id) {
+  killSent.add(id);
+  const row = flightRows.get(id);
+  if (row && row._r) fillFlightRow(row, row._r);
+  let res;
+  try { res = await api(`/admin/inflight/${id}/cancel`, { method: "POST" }); }
+  catch { killSent.delete(id); toast("Kill failed — cannot reach the proxy", "bad"); return; }
+  if (res.status === 404) {
+    // Benign race: it completed between the last poll and the click.
+    killSent.delete(id);
+    toast(`Request #${id} already finished`);
+  } else if (!res.ok) {
+    killSent.delete(id);
+    const err = await res.json().catch(() => ({}));
+    toast(err.error || `Kill failed (${res.status})`, "bad");
+  } else {
+    toast(`Killed request #${id}`);
+  }
+  pollFlight();
 }
 
 function timeCell(label, value) {

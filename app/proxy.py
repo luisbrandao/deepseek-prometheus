@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import json
 import logging
@@ -282,7 +283,8 @@ def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
 
 
 async def _handle_non_stream(
-    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
+    entry=None,
 ) -> Response:
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
@@ -339,6 +341,9 @@ async def _handle_non_stream(
         else:
             _record_metrics(pname, model, in_tokens, out_tokens, duration)
 
+    if entry is not None:
+        entry.record(status_code, in_tokens, out_tokens)
+
     resp_headers.pop("content-length", None)
     resp_headers.pop("transfer-encoding", None)
     resp_headers.pop("content-encoding", None)
@@ -382,7 +387,10 @@ async def _handle_stream(
     stream_cm = client.stream(method, url, headers=headers, content=body)
     try:
         resp = await stream_cm.__aenter__()
-    except httpx.RequestError:
+    except BaseException:
+        # RequestError (the dispatcher fails over on it) or cancellation (an
+        # operator kill landing while we connect) — either way this client would
+        # otherwise leak its connection. Re-raised unchanged.
         await client.aclose()
         raise
 
@@ -403,6 +411,8 @@ async def _handle_stream(
                 await on_complete()
 
         resp_body = _decompress(raw, content_encoding).decode("utf-8", errors="replace")
+        if entry is not None:
+            entry.record(status_code)
         _log_upstream_error(pname, model, status_code, resp_body)
         if model != "unknown":
             ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
@@ -420,6 +430,10 @@ async def _handle_stream(
         )
 
     async def generate():
+        # Runs in Starlette's body task, not the request task — bind it so a kill
+        # cancels the generator rather than the disconnect listener above it.
+        if entry is not None:
+            entry.bind_stream()
         in_tokens = 0
         out_tokens = 0
         buffer = ""
@@ -465,20 +479,37 @@ async def _handle_stream(
                                     reasoning_contents.append(reasoning)
                     except json.JSONDecodeError:
                         pass
+        except asyncio.CancelledError:
+            # Killed from the console. The 200 was committed with the first chunk,
+            # so there is no status code left to send the client — ending the SSE
+            # stream here is all a kill can mean. Returning instead of propagating
+            # keeps uvicorn from logging a deliberate operator action as an
+            # "Exception in ASGI application" traceback. `error` stays True so the
+            # truncated generation isn't recorded as throughput metrics.
+            error = True
+            if entry is None or not entry.cancelled:
+                # Shutdown, or the client vanished — not ours to swallow.
+                raise
+            logger.info(
+                f"Stream for request #{entry.id} cut after {entry.chunks} chunk(s) — cancelled"
+            )
         except Exception as e:
             error = True
             logger.error(f"Stream error from '{pname}' (model: {model}): {type(e).__name__}: {e}")
         finally:
-            # Done first, and sync, so a raising await below can never leave a
-            # phantom row in the console's in-flight view. This is the stream's
-            # single close point (proxy_request hands the entry off to us).
+            # Bookkeeping first, and all of it sync, so none of it can be skipped
+            # by an await below raising. This is the stream's single close point
+            # for the in-flight entry: proxy_request hands it off to us, since the
+            # handler returns long before the body is done. record-then-finish, so
+            # the history row carries the outcome and not just "it ended".
+            duration = time.time() - start
             if entry is not None:
+                entry.record(status_code, in_tokens, out_tokens)
                 entry.finish()
             await stream_cm.__aexit__(None, None, None)
             await client.aclose()
             if on_complete is not None:
                 await on_complete()
-            duration = time.time() - start
             if model != "unknown":
                 if error:
                     ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
@@ -617,8 +648,17 @@ async def _dispatch(
                     on_complete=_release, entry=entry,
                 )
             else:
-                resp = await _handle_non_stream(request, provider, path, body, body_str, target.model)
+                resp = await _handle_non_stream(
+                    request, provider, path, body, body_str, target.model, entry=entry
+                )
                 await slots.release(target.provider)
+        except asyncio.CancelledError:
+            # An operator kill (or a client disconnect) while we were forwarding.
+            # Nothing has released the slot on this path: the non-stream branch
+            # never reached its release, and for a stream the generator that owns
+            # the release never ran. Release here, then keep unwinding.
+            await slots.release(target.provider)
+            raise
         except httpx.RequestError as e:
             await slots.release(target.provider)
             last_exc = e
@@ -658,6 +698,20 @@ async def _dispatch(
     if last_exc is None:
         last_exc = httpx.ConnectError("no backends available")
     return _backend_error(last_provider, "unknown", last_exc)
+
+
+def _cancelled_response() -> Response:
+    """Terminal response for a request killed from the console. 503 with an
+    OpenAI-shaped error body, matching the slot-timeout response, so clients
+    handle it as an ordinary upstream failure rather than a protocol surprise."""
+    payload = {
+        "error": {
+            "message": "Request cancelled by the proxy operator",
+            "type": "cancelled",
+            "code": 503,
+        }
+    }
+    return Response(content=json.dumps(payload), status_code=503, media_type="application/json")
 
 
 def _unauthorized(model: str) -> Response:
@@ -707,11 +761,26 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     )
     try:
         resp = await _route(request, path, body, body_str, payload, entry)
+    except asyncio.CancelledError:
+        entry.finish()
+        if not entry.cancelled:
+            # The client went away (or we're shutting down): normal cancellation,
+            # let it propagate untouched.
+            raise
+        # Killed from the console. Answer the client rather than letting uvicorn
+        # turn the cancellation into a 500 with a traceback. Safe to stop the
+        # unwind here: the cancellation has already been delivered, so the awaits
+        # needed to send this response still run.
+        logger.warning(
+            f"Request #{entry.id} ({entry.model or entry.path}"
+            f"{' on ' + entry.provider if entry.provider else ''}) cancelled from the console"
+        )
+        return _cancelled_response()
     except BaseException:
         entry.finish()
         raise
     if not isinstance(resp, StreamingResponse):
-        entry.finish()
+        entry.finish(fallback_status=resp.status_code)
     return resp
 
 
@@ -740,7 +809,9 @@ async def _route(
                 return await _handle_stream(
                     request, provider, path, body, body_str, "unknown", entry=entry
                 )
-            return await _handle_non_stream(request, provider, path, body, body_str, "unknown")
+            return await _handle_non_stream(
+                request, provider, path, body, body_str, "unknown", entry=entry
+            )
         except httpx.RequestError as e:
             return _backend_error(provider, "unknown", e)
 

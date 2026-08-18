@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -334,6 +335,45 @@ async def admin_inflight(request: Request):
     ]
     snap["queue_timeout"] = conf.ROUTING.queue_timeout
     return snap
+
+
+@app.post("/admin/inflight/{request_id}/cancel")
+async def admin_cancel_inflight(request_id: int, request: Request):
+    """Kill one in-flight request — the console's per-row Kill button.
+
+    Cancels the asyncio task serving it (see `inflight.Entry.cancel`), which
+    unwinds the normal cleanup: slot released, upstream connection closed, entry
+    deregistered. Works on a queued request and on one blocked in an upstream
+    read that may never return.
+
+    404 means the id is unknown, which almost always means the request finished on
+    its own between the console's last poll and the click — not an error worth
+    alarming anyone about.
+
+    This is logged here, at WARNING, because it is a deliberate operator action
+    *and* because the killed request may lose its own `event=request` line: the
+    cancellation can interrupt the background task that emits it.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    entry = inflight.get(request_id)
+    if entry is None:
+        return JSONResponse(
+            {"error": f"no in-flight request with id {request_id} — it already finished"},
+            status_code=404,
+        )
+    logging.getLogger("llm-proxy").warning(
+        "Cancelling in-flight request #%d: %s (%s) on %s, %s for %.1fs — operator action",
+        entry.id,
+        entry.model or entry.path,
+        entry.state,
+        entry.provider or "no backend yet",
+        "streaming" if entry.stream else "buffered",
+        max(0.0, time.monotonic() - entry.arrived),
+    )
+    entry.cancel()
+    return {"id": entry.id, "status": "cancelled", "state": entry.state}
 
 
 @app.get("/admin/routing")
