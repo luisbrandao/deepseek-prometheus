@@ -119,6 +119,14 @@ class Routing:
     failover: bool = True        # on backend error, try the next-priority target
     auto_group: bool = True      # group identical model ids across providers
     down_backoff: float = 15.0   # seconds a failed backend is skipped for
+    # Queue admission: prefer a waiting request whose model the freeing provider
+    # already has loaded over strict FIFO, so a local backend isn't made to swap
+    # models it is about to need again. See app/slots.py for the reasoning.
+    queue_affinity: bool = True
+    # How many times affinity may pass over a waiting request before that request
+    # is served regardless of what is loaded. Bounds the unfairness; 0 means
+    # affinity never applies (strict FIFO).
+    affinity_max_skips: int = 3
     # Upstream HTTP error statuses that trigger failover to the next target
     # (rather than relaying the error to the client). Server errors + rate
     # limiting by default; 4xx like 400/404 are request problems every backend
@@ -188,6 +196,8 @@ def _load(text: bytes):
         failover=bool(r.get("failover", True)),
         auto_group=bool(r.get("auto_group", True)),
         down_backoff=float(r.get("down_backoff", 15)),
+        queue_affinity=bool(r.get("queue_affinity", True)),
+        affinity_max_skips=max(0, int(r.get("affinity_max_skips", 3))),
         failover_statuses=(
             frozenset(int(s) for s in fos)
             if fos is not None

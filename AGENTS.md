@@ -17,7 +17,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 |---|---|
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
-| `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission (round-robin within a tie tier) + queue via a lazily-created `asyncio.Condition`. |
+| `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout, on_skip)` / `release(provider, model)` / `poke()`. Priority admission (round-robin within a tie tier), then an **explicit** queue of `_Waiter` futures with model-affinity reordering. Also `in_use`/`resident_model`/`queue_depth` for introspection. |
 | `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, and `Entry.cancel()` for the Kill button. Observation only apart from `cancel` — nothing in the *request path* reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
@@ -54,9 +54,25 @@ decompresses the response. Single process, async, one uvicorn worker.
   `_dispatch` after the call. Stream: released in the generator's `finally` via the
   `on_complete` callback (the handler returns before streaming finishes). If you add a
   code path, guarantee release on every exit including errors and client disconnect.
-- **Async primitives are lazily created** (`slots._condition()`, `registry._lock_for`)
-  so they bind to uvicorn's running loop, not the import-time loop. Do not move them to
-  module-level construction — it breaks under some Python/loop setups.
+- **Async primitives are lazily created** (`registry._lock_for`, and each
+  `slots._Waiter.future`) so they bind to uvicorn's running loop, not the import-time
+  loop. Do not move them to module-level construction — it breaks under some
+  Python/loop setups.
+- **Slot admission is a synchronous handoff, and needs no lock.** `slots` has no
+  Condition any more: a release decrements, then `_drain()` picks the best waiter and
+  resolves its future, all in one synchronous step with no `await` between. That is what
+  makes it correct without a lock and what stops a newly arrived request from barging
+  past the queue — so **never introduce an `await` inside `_drain`/`_release`/`_choose`
+  or the accounting becomes observable mid-update.** Two consequences to preserve:
+  `acquire`'s `finally` must hand back a slot granted in the instant it gave up
+  (`w.granted and not w.taken` — the timeout/cancel race), and `release` must be passed
+  the **native model** that finished, or affinity has nothing to work from and silently
+  degrades to FIFO.
+- **Affinity only reorders waiting requests.** It must never change which targets a
+  request is eligible for, never hold a slot idle waiting for a better match, and never
+  be consulted on the fast path. `Routing.affinity_max_skips` is the starvation bound and
+  is checked *before* affinity in `_choose` — keep that order, it is the only thing
+  stopping a hot model from starving a cold one.
 - **Streaming fails over only pre-first-byte.** `_handle_stream` pre-flights the
   connection (`stream_cm.__aenter__`) and re-raises `RequestError` so `_dispatch` can try
   the next target *before* a `StreamingResponse` commits its 200 status. Don't move the

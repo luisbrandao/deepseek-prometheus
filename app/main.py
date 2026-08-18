@@ -330,10 +330,15 @@ async def admin_inflight(request: Request):
             "slots": p.slots,
             "in_use": slots.in_use(p.name),
             "is_down": registry.is_down(p.name),
+            # What this backend most recently ran, i.e. what it is expected to
+            # still have loaded — the basis of the queue's affinity decision.
+            "resident": slots.resident_model(p.name),
         }
         for p in conf.PROVIDERS
     ]
     snap["queue_timeout"] = conf.ROUTING.queue_timeout
+    snap["queue_affinity"] = conf.ROUTING.queue_affinity
+    snap["affinity_max_skips"] = conf.ROUTING.affinity_max_skips
     return snap
 
 

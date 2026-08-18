@@ -69,6 +69,7 @@ class Entry:
         "method", "path", "req_bytes", "client_ip", "svc", "provider",
         "native_model", "candidates", "attempt", "slot_at", "chunks",
         "task", "stream_task", "cancelled", "status", "in_tokens", "out_tokens",
+        "skipped",
     )
 
     def __init__(self, model, stream, op, method, path, req_bytes, client_ip, svc):
@@ -90,6 +91,9 @@ class Entry:
         self.native_model = None
         self.candidates = []
         self.attempt = 0
+        # Times the slot queue admitted a later request ahead of this one because
+        # the provider already had that model loaded (see app/slots.py).
+        self.skipped = 0
         self.slot_at = None
         self.chunks = 0
         # The task serving this request — uvicorn's per-request ASGI task, since
@@ -123,6 +127,11 @@ class Entry:
         self.native_model = native_model
         self.slot_at = time.monotonic()
         self.attempt += 1
+
+    def passed_over(self) -> None:
+        """Model affinity let a later request go first. Surfaced on the queued row
+        so the reordering is visible rather than looking like a stall."""
+        self.skipped += 1
 
     def chunk(self) -> None:
         """Count one SSE `data:` event, so a streaming row shows visible progress
@@ -228,6 +237,7 @@ class Entry:
             "native_model": self.native_model,
             "candidates": self.candidates,
             "attempt": self.attempt,
+            "skipped": self.skipped,
             "stream": self.stream,
             "op": self.op,
             "method": self.method,

@@ -623,7 +623,9 @@ async def _dispatch(
         # candidate list.
         entry.wait(remaining)
         try:
-            target = await slots.acquire(remaining, conf.ROUTING.queue_timeout)
+            target = await slots.acquire(
+                remaining, conf.ROUTING.queue_timeout, on_skip=entry.passed_over
+            )
         except slots.SlotTimeout:
             return Response(
                 content=json.dumps({"error": {"message": "No backend slot available (queue timeout)", "type": "slot_timeout", "code": 503}}),
@@ -638,8 +640,8 @@ async def _dispatch(
 
         try:
             if is_stream:
-                async def _release(p=target.provider):
-                    await slots.release(p)
+                async def _release(p=target.provider, m=target.model):
+                    await slots.release(p, m)
 
                 # Slot is released by the generator's finally once streaming ends,
                 # or — on a pre-first-byte error — via on_complete inside the handler.
@@ -651,16 +653,16 @@ async def _dispatch(
                 resp = await _handle_non_stream(
                     request, provider, path, body, body_str, target.model, entry=entry
                 )
-                await slots.release(target.provider)
+                await slots.release(target.provider, target.model)
         except asyncio.CancelledError:
             # An operator kill (or a client disconnect) while we were forwarding.
             # Nothing has released the slot on this path: the non-stream branch
             # never reached its release, and for a stream the generator that owns
             # the release never ran. Release here, then keep unwinding.
-            await slots.release(target.provider)
+            await slots.release(target.provider, target.model)
             raise
         except httpx.RequestError as e:
-            await slots.release(target.provider)
+            await slots.release(target.provider, target.model)
             last_exc = e
             if not conf.ROUTING.failover:
                 return _backend_error(provider, target.model, e)

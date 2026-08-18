@@ -43,6 +43,20 @@ QUEUE_WAITING = Gauge(
     "Requests currently waiting for a free slot",
 )
 
+QUEUE_AFFINITY_GRANTS = Counter(
+    "llm_proxy_queue_affinity_grants_total",
+    "Times a queued request was admitted ahead of an earlier one because the "
+    "provider already had its model loaded",
+    ["provider"],
+)
+
+QUEUE_STARVATION_YIELDS = Counter(
+    "llm_proxy_queue_starvation_yields_total",
+    "Times the affinity_max_skips cap forced FIFO admission to stop a passed-over "
+    "request from waiting any longer",
+    ["provider"],
+)
+
 FAILOVERS_TOTAL = Counter(
     "llm_proxy_failovers_total",
     "Times a request failed over from one backend to the next",
@@ -58,6 +72,8 @@ PERSISTABLE_COUNTERS = {
     "llm_proxy_tokens_output_total": TOKENS_OUTPUT_TOTAL,
     "llm_proxy_errors_total": ERRORS_TOTAL,
     "llm_proxy_failovers_total": FAILOVERS_TOTAL,
+    "llm_proxy_queue_affinity_grants_total": QUEUE_AFFINITY_GRANTS,
+    "llm_proxy_queue_starvation_yields_total": QUEUE_STARVATION_YIELDS,
 }
 
 

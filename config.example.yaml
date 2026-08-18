@@ -136,6 +136,13 @@ routing:
   failover: true       # on backend error, retry the next-priority target
   auto_group: true     # identical canonical names across backends load-balance
   down_backoff: 15     # seconds a failed backend is skipped before retrying
+  # When a slot frees, prefer a queued request whose model the backend already has
+  # loaded over strict FIFO — a local backend that swaps models pays seconds per
+  # swap, and FIFO happily swaps a model out that the next request needs back.
+  queue_affinity: true
+  # Times affinity may pass over a waiting request before it is admitted anyway.
+  # Bounds the unfairness; 0 means strict FIFO.
+  affinity_max_skips: 3
   # Upstream HTTP statuses that count as a "backend error" and trigger failover
   # to the next target (a connection failure always does). 4xx like 400/404 are
   # relayed as-is — every backend would reject them the same way. Default below.

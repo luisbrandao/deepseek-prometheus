@@ -214,6 +214,11 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   border-radius: 6px; padding: 2px 7px;
 }
 .flslot span { font-family: var(--mono); color: var(--muted); }
+.flres {
+  font-style: normal; font-family: var(--mono); font-size: 10.5px;
+  color: var(--accent); opacity: .85; max-width: 130px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .flslot.full { border-color: rgba(224,169,59,.5); }
 .flslot.full span { color: var(--amber); }
 .flslot.down { border-color: rgba(229,96,77,.45); opacity: .7; }

@@ -390,7 +390,11 @@ function renderFlight(data) {
     const full = p.slots != null && p.in_use >= p.slots;
     const chip = el("span", "flslot" + (full ? " full" : "") + (p.is_down ? " down" : ""));
     chip.append(el("b", null, p.name), el("span", null, `${p.in_use}/${p.slots == null ? "∞" : p.slots}`));
-    chip.title = p.is_down ? "marked down" : full ? "no free slot — new requests queue here" : "";
+    if (p.resident) chip.appendChild(el("i", "flres", p.resident));
+    chip.title = [
+      p.is_down ? "marked down" : full ? "no free slot — new requests queue here" : "",
+      p.resident ? `last ran ${p.resident} — queued requests for it skip ahead` : "",
+    ].filter(Boolean).join(" · ");
     slotsWrap.appendChild(chip);
   }
 
@@ -454,7 +458,7 @@ function renderFlight(data) {
 function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
-    r.provider, r.attempt, r.in_tokens, r.out_tokens, r.client_host,
+    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.client_host,
     killArmed.has(r.id), killSent.has(r.id),
   ].join("\u0001");
 }
@@ -487,6 +491,12 @@ function fillFlightRow(row, r) {
     const a = el("span", "fltag warn", "attempt " + r.attempt);
     a.title = "failed over from an earlier backend";
     line1.appendChild(a);
+  }
+  if (r.skipped) {
+    const sk = el("span", "fltag warn", "passed over " + r.skipped + "\u00d7");
+    sk.title = "the backend already had another request's model loaded, so that one "
+      + "went first — this is capped, see routing.affinity_max_skips";
+    line1.appendChild(sk);
   }
   if (r.status != null && r.status >= 400) {
     line1.appendChild(el("span", "fltag bad", "HTTP " + r.status));

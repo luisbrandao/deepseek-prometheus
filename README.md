@@ -15,6 +15,9 @@ request a **clean model name** — the proxy decides *which* backend actually se
   `local.qwen-medium:low`); no need to know which server runs it.
 - **Priority + slots** — prefer your fast/cheap backend, cap concurrency per backend,
   and **queue** requests when every candidate is busy.
+- **Swap-aware queueing** — when a local backend frees up, the queue prefers a request
+  for the model it *already has loaded*, so it isn't made to swap out a model it is
+  about to need again.
 - **Failover** — if a backend errors, the request retries the next one; offline
   backends drop out of the model list and are skipped.
 - **In-flight visibility** — the console's In-flight tab lists every request currently
@@ -76,6 +79,43 @@ equal-priority backends share load evenly. If all candidates are full it **waits
 > Example: `glm-4.7-flash` runs on `ollamaCitrine` (fast, priority 1) and `ollamaGW`
 > (slow, priority 2). Citrine is preferred until full, then gw; if both are full the
 > request waits. Two backends at the *same* priority would instead alternate per request.
+
+A released slot is handed **directly** to a chosen waiter, in the same step as the
+release — it is never observable as free while somebody is queued for it, so a newly
+arrived request cannot barge past the queue.
+
+#### Model affinity: the queue reorders to avoid swaps
+
+Local backends (llama-swap, ollama) hold one model resident and swap on demand, and a
+swap costs seconds of load time — usually far more than the request itself. Strict FIFO
+provokes the worst case. Take a single-slot `citrine` serving `modelA` and `modelB`:
+
+| | queue order served | backend model loads |
+|---|---|---|
+| FIFO | `modelA` running → `modelB`, `modelA` | **3** — swap B in, swap A back |
+| Affinity | `modelA` running → `modelA`, `modelB` | **2** — A stays, B swaps in once |
+
+So when capacity frees, admission prefers a waiter whose model that backend **already has
+resident** — running there now, or the one it just finished — over one that would force a
+swap. Measured on a synthetic backend with a 3s swap and 1s generation, that exact
+three-request scenario ran in **9.0s instead of 12.0s**, and the second `modelA` request
+finished in 3.6s instead of 10.6s. The trade is real and worth stating: `modelB` waited
+about a second longer.
+
+This only reorders *waiting* requests. It never changes which backends a request may use,
+and never holds a slot idle hoping for a better match — a lone non-matching waiter is
+admitted immediately.
+
+**Starvation is bounded.** A waiter passed over `routing.affinity_max_skips` times (default
+`3`) is admitted next regardless of what is loaded, so a steady stream of `modelA` cannot
+starve `modelB` indefinitely. Set `affinity_max_skips: 0` or `queue_affinity: false` for
+strict FIFO.
+
+Watch it work: `llm_proxy_queue_affinity_grants_total` counts reorderings and
+`llm_proxy_queue_starvation_yields_total` counts times the cap had to intervene (a
+consistently high ratio of yields means the cap is too tight for your traffic). The
+In-flight tab marks a passed-over row `passed over N×` and shows each backend's resident
+model on its chip.
 
 ### Failover
 
@@ -207,7 +247,7 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
   an entry.
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
-  `failover_statuses` (see above).
+  `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above).
 
 ### Environment variables
 
@@ -375,6 +415,8 @@ Scrape `http://<host>:8000/metrics`:
 | `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
 | `llm_proxy_queue_waiting` | Gauge | — | Requests currently waiting for a slot |
 | `llm_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
+| `llm_proxy_queue_affinity_grants_total` | Counter | `provider` | Times the queue admitted a request ahead of an earlier one to avoid a model swap |
+| `llm_proxy_queue_starvation_yields_total` | Counter | `provider` | Times `affinity_max_skips` forced FIFO to unblock a passed-over request |
 
 > **Metric prefix:** as of the multi-backend rework these use `llm_proxy_` (was
 > `deepseek_proxy_`). Update existing Grafana/alert queries accordingly.
