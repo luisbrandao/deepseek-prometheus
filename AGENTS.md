@@ -18,6 +18,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission (round-robin within a tie tier) + queue via a lazily-created `asyncio.Condition`. |
+| `app/inflight.py` | Live registry of in-flight requests: `begin()` per request, `Entry.wait/run/chunk/finish`, `snapshot()`. Backs the console's In-flight tab. Observation only — nothing in the request path reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
@@ -88,6 +89,14 @@ decompresses the response. Single process, async, one uvicorn worker.
   `priority:` field, failed parse-back self-check) returns `(False, reason)` with
   the file untouched; the live change stands and the endpoint reports
   `persisted: false`. Persist failures are warnings, never 500s.
+- **In-flight registry (`inflight.py`) has exactly one closer per entry.** `proxy_request`
+  opens the entry and closes it for every response *except* a `StreamingResponse` — that
+  one is still in flight when the handler returns, so `_handle_stream`'s generator closes
+  it in its `finally` (first statement, before any `await`, so a raising await can't leave
+  a phantom row). `finish()` is idempotent. Mirror the slot-release rule: if you add a code
+  path, guarantee the entry is closed on every exit including errors and client disconnect.
+  Keep it write-only from the request path — never let admission, routing or failover read
+  it, or an observability bug becomes a routing bug.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
   cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
   or the histogram. Persistence must never crash startup or a request — failures are logged

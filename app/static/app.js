@@ -8,6 +8,7 @@
 
 const KEY_STORE = "llmproxy.key";
 const LOG_POLL_MS = 1500;
+const FLIGHT_POLL_MS = 1000;
 const MAX_LOG_LINES = 3000;
 
 const $ = (sel) => document.querySelector(sel);
@@ -65,6 +66,7 @@ function activateTab(name) {
   $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "logging") startLogPolling(); else stopLogPolling();
+  if (name === "inflight") startFlightPolling(); else stopFlightPolling();
   if (name === "models") loadCatalog();
   if (name === "routing") loadRouting();
 }
@@ -311,6 +313,162 @@ async function probeUpstreams() {
   }
 }
 
+/* ── In-flight ─────────────────────────────────────────────── */
+/* Polls /admin/inflight and re-renders the whole list each tick. Rows are
+ * keyed by request id so the DOM is patched rather than rebuilt — otherwise a
+ * 1s rebuild would fight text selection and flicker the timers. */
+let flightTimer = null;
+const flightRows = new Map(); // id -> row element
+
+function startFlightPolling() {
+  if (flightTimer) return;
+  pollFlight();
+  flightTimer = setInterval(pollFlight, FLIGHT_POLL_MS);
+}
+function stopFlightPolling() {
+  clearInterval(flightTimer);
+  flightTimer = null;
+}
+
+// Whole seconds under a minute, then m:ss — an in-flight request is short-lived,
+// so precision matters more than the H:MM:SS the log lines use.
+function dur(sec) {
+  if (sec == null) return "—";
+  if (sec < 60) return sec.toFixed(1) + "s";
+  const m = Math.floor(sec / 60);
+  return m + "m" + String(Math.floor(sec % 60)).padStart(2, "0") + "s";
+}
+
+function bytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB";
+  return (n / 1024 / 1024).toFixed(1) + " MiB";
+}
+
+async function pollFlight() {
+  if (!$("#fl-live").checked && flightTimer) return;
+  let res;
+  try { res = await api("/admin/inflight"); }
+  catch { return; }
+  if (res.status === 403) {
+    flightRows.clear();
+    $("#fl-body").innerHTML = '<div class="notice">Unauthorized — set a valid bearer key to view in-flight requests.</div>';
+    $("#fl-summary").textContent = "";
+    $("#fl-slots").textContent = "";
+    return;
+  }
+  if (!res.ok) return;
+  renderFlight(await res.json());
+}
+
+function renderFlight(data) {
+  const running = data.running || 0;
+  const queued = data.queued || 0;
+  const sum = $("#fl-summary");
+  sum.innerHTML = "";
+  sum.append(
+    el("span", "flstat run", running + " running"),
+    el("span", "flstat queue" + (queued ? " hot" : ""), queued + " queued"),
+  );
+
+  // Per-provider occupancy: the capacity that decides whether the queue drains.
+  const slotsWrap = $("#fl-slots");
+  slotsWrap.innerHTML = "";
+  for (const p of data.providers || []) {
+    const full = p.slots != null && p.in_use >= p.slots;
+    const chip = el("span", "flslot" + (full ? " full" : "") + (p.is_down ? " down" : ""));
+    chip.append(el("b", null, p.name), el("span", null, `${p.in_use}/${p.slots == null ? "∞" : p.slots}`));
+    chip.title = p.is_down ? "marked down" : full ? "no free slot — new requests queue here" : "";
+    slotsWrap.appendChild(chip);
+  }
+
+  const body = $("#fl-body");
+  const reqs = data.requests || [];
+  if (!reqs.length) {
+    flightRows.clear();
+    body.innerHTML = '<div class="notice">Nothing in flight.</div>';
+    return;
+  }
+  // Queued first — those are the ones you opened this tab to look at — then
+  // running, each group oldest-first (the API already returns arrival order).
+  const ordered = [
+    ...reqs.filter((r) => r.state === "queued"),
+    ...reqs.filter((r) => r.state !== "queued"),
+  ];
+
+  if (!body.querySelector(".fllist")) {
+    body.innerHTML = "";
+    body.appendChild(el("div", "fllist"));
+  }
+  const list = body.querySelector(".fllist");
+
+  const seen = new Set();
+  ordered.forEach((r, i) => {
+    seen.add(r.id);
+    let row = flightRows.get(r.id);
+    if (!row) {
+      row = el("div", "flrow");
+      flightRows.set(r.id, row);
+    }
+    fillFlightRow(row, r);
+    // Keep DOM order in sync with the sorted list.
+    if (list.children[i] !== row) list.insertBefore(row, list.children[i] || null);
+  });
+  for (const [id, row] of flightRows) {
+    if (!seen.has(id)) { row.remove(); flightRows.delete(id); }
+  }
+}
+
+function fillFlightRow(row, r) {
+  const queued = r.state === "queued";
+  row.className = "flrow " + (queued ? "queued" : "running");
+  row.innerHTML = "";
+
+  row.appendChild(el("span", "flstate", queued ? "queued" : "running"));
+
+  const main = el("div", "flmain");
+  const line1 = el("div", "flline");
+  line1.appendChild(el("span", "flmodel", r.model || r.path));
+  if (r.stream) line1.appendChild(el("span", "fltag", "stream"));
+  if (r.op) line1.appendChild(el("span", "fltag", r.op));
+  if (r.attempt > 1) {
+    const a = el("span", "fltag warn", "attempt " + r.attempt);
+    a.title = "failed over from an earlier backend";
+    line1.appendChild(a);
+  }
+  main.appendChild(line1);
+
+  const line2 = el("div", "flline sub");
+  if (queued) {
+    // What it is waiting on is the whole point of the queued view.
+    line2.appendChild(el("span", "flwait", "waiting for: " + (r.candidates || []).join(", ")));
+  } else {
+    line2.appendChild(el("span", "flprov", r.provider || "—"));
+    if (r.native_model && r.native_model !== r.model) {
+      line2.appendChild(el("span", "flnative", r.native_model));
+    }
+  }
+  const who = r.client_host || r.client_ip;
+  line2.appendChild(el("span", "flwho", (r.svc ? r.svc + " · " : "") + who));
+  main.appendChild(line2);
+  row.appendChild(main);
+
+  const times = el("div", "fltimes");
+  times.appendChild(timeCell("age", dur(r.age)));
+  times.appendChild(timeCell("queued", dur(r.queued_for)));
+  times.appendChild(timeCell("running", dur(r.running_for)));
+  if (r.stream) times.appendChild(timeCell("chunks", r.chunks == null ? "—" : String(r.chunks)));
+  times.appendChild(timeCell("body", bytes(r.req_bytes)));
+  row.appendChild(times);
+}
+
+function timeCell(label, value) {
+  const c = el("div", "flcell");
+  c.append(el("span", "fllabel", label), el("span", "flvalue", value));
+  return c;
+}
+
 /* ── Routing ───────────────────────────────────────────────── */
 async function loadRouting() {
   let res;
@@ -507,6 +665,7 @@ function initKey() {
     const active = ($(".tab.active") || {}).dataset?.tab;
     loadLogFlags();
     if (active === "logging") resetLogTail();
+    if (active === "inflight") pollFlight();
     if (active === "models") { loadCatalog(); }
     if (active === "routing") loadRouting();
   };
@@ -525,6 +684,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#log-level").addEventListener("change", resetLogTail);
   $("#log-search").addEventListener("input", applyLogFilter);
   $("#log-clear").addEventListener("click", () => { $("#log-pane").innerHTML = ""; logLineCount = 0; $("#log-count").textContent = ""; });
+
+  $("#fl-refresh").addEventListener("click", pollFlight);
+  $("#fl-live").addEventListener("change", (e) => {
+    if (e.target.checked) startFlightPolling();
+  });
 
   $("#models-refresh").addEventListener("click", loadCatalog);
   $("#models-probe").addEventListener("click", probeUpstreams);

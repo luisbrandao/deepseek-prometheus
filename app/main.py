@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, logbuffer, persistence, registry, slots
+from app import auth, configwrite, inflight, logbuffer, persistence, registry, slots
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -67,9 +67,10 @@ _attach_buffer(_event_logger)
 
 
 # Access-log paths that are pure noise: the web console tails logs by polling
-# /admin/logs every ~1.5s, which would otherwise flood the very view you're
-# watching (and docker logs). Matched as a substring of the rendered access line.
-_ACCESS_LOG_MUTE = ("/admin/logs",)
+# /admin/logs every ~1.5s and the in-flight view by polling /admin/inflight every
+# ~1s, which would otherwise flood the very view you're watching (and docker
+# logs). Matched as a substring of the rendered access line.
+_ACCESS_LOG_MUTE = ("/admin/logs", "/admin/inflight")
 
 
 class _MutePollingFilter(logging.Filter):
@@ -306,6 +307,33 @@ async def admin_upstream_models(request: Request):
 
     results = await asyncio.gather(*(probe(p) for p in conf.PROVIDERS))
     return {"providers": results}
+
+
+@app.get("/admin/inflight")
+async def admin_inflight(request: Request):
+    """Everything currently in flight: requests holding a slot and requests
+    queued behind one, arrival-ordered, plus each provider's slot occupancy.
+
+    Read-only snapshot of process-local state (see app/inflight.py) — cheap
+    enough for the console to poll every second. The provider block is the same
+    slot accounting the Routing tab shows, repeated here so the queue and the
+    capacity that gates it read side by side.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    snap = inflight.snapshot()
+    snap["providers"] = [
+        {
+            "name": p.name,
+            "slots": p.slots,
+            "in_use": slots.in_use(p.name),
+            "is_down": registry.is_down(p.name),
+        }
+        for p in conf.PROVIDERS
+    ]
+    snap["queue_timeout"] = conf.ROUTING.queue_timeout
+    return snap
 
 
 @app.get("/admin/routing")

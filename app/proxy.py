@@ -13,7 +13,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, clientinfo, registry, router, slots
+from app import auth, clientinfo, inflight, registry, router, slots
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -356,7 +356,7 @@ async def _handle_non_stream(
 
 async def _handle_stream(
     request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
-    on_complete=None,
+    on_complete=None, entry=None,
 ) -> Union[Response, StreamingResponse]:
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
@@ -443,6 +443,8 @@ async def _handle_stream(
                     payload = line[5:].strip()
                     if payload == "[DONE]":
                         continue
+                    if entry is not None:
+                        entry.chunk()
                     try:
                         data = json.loads(payload)
                         resp_model = data.get("model", resp_model)
@@ -467,6 +469,11 @@ async def _handle_stream(
             error = True
             logger.error(f"Stream error from '{pname}' (model: {model}): {type(e).__name__}: {e}")
         finally:
+            # Done first, and sync, so a raising await below can never leave a
+            # phantom row in the console's in-flight view. This is the stream's
+            # single close point (proxy_request hands the entry off to us).
+            if entry is not None:
+                entry.finish()
             await stream_cm.__aexit__(None, None, None)
             await client.aclose()
             if on_complete is not None:
@@ -564,7 +571,7 @@ def _should_failover(status: int) -> bool:
 
 
 async def _dispatch(
-    request: Request, path: str, payload: dict, is_stream: bool, targets: list
+    request: Request, path: str, payload: dict, is_stream: bool, targets: list, entry
 ) -> Union[Response, StreamingResponse]:
     """Acquire a slot on the best available target and forward, failing over to
     the next-priority target when a backend errors out (when failover is enabled).
@@ -579,6 +586,11 @@ async def _dispatch(
     last_exc = None
 
     while remaining:
+        # Mark queued *before* acquiring: for a request that has to wait, this is
+        # the only moment we can record what it is waiting on. Re-armed on every
+        # iteration so a failover shows up as queued again, with the shortened
+        # candidate list.
+        entry.wait(remaining)
         try:
             target = await slots.acquire(remaining, conf.ROUTING.queue_timeout)
         except slots.SlotTimeout:
@@ -590,6 +602,7 @@ async def _dispatch(
 
         provider = conf.PROVIDERS_BY_NAME[target.provider]
         last_provider = provider
+        entry.run(target.provider, target.model)
         body, body_str = _build_body(payload, provider, target.model)
 
         try:
@@ -600,7 +613,8 @@ async def _dispatch(
                 # Slot is released by the generator's finally once streaming ends,
                 # or — on a pre-first-byte error — via on_complete inside the handler.
                 resp = await _handle_stream(
-                    request, provider, path, body, body_str, target.model, on_complete=_release
+                    request, provider, path, body, body_str, target.model,
+                    on_complete=_release, entry=entry,
                 )
             else:
                 resp = await _handle_non_stream(request, provider, path, body, body_str, target.model)
@@ -658,10 +672,16 @@ def _unauthorized(model: str) -> Response:
 
 
 async def proxy_request(request: Request, path: str) -> Union[Response, StreamingResponse]:
+    """Entry point for every proxied call. Parses the body once, registers the
+    request in the in-flight view, then hands off to `_route`.
+
+    The in-flight entry is closed here for anything that returns a finished
+    response. A `StreamingResponse` is the one exception: it is still in flight
+    when we return it, so `_handle_stream`'s generator closes the entry in its
+    `finally` — the same place the slot is released.
+    """
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
-
-    authorized = auth.is_authorized(request)
 
     payload = None
     raw_model = None
@@ -671,7 +691,38 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
         raw_model = payload.get("model")
         is_stream = payload.get("stream", False)
     except (json.JSONDecodeError, AttributeError):
+        # Not a JSON object (or not JSON at all): treated as a passthrough below.
         payload = None
+
+    ua = (request.headers.get("user-agent") or "").strip() or None
+    entry = inflight.begin(
+        model=raw_model or None,
+        stream=bool(is_stream),
+        op=_op_kind(request.url.path, raw_model or ""),
+        method=request.method,
+        path=request.url.path,
+        req_bytes=len(body),
+        client_ip=clientinfo.client_ip(request),
+        svc=clientinfo.service_from_ua(ua),
+    )
+    try:
+        resp = await _route(request, path, body, body_str, payload, entry)
+    except BaseException:
+        entry.finish()
+        raise
+    if not isinstance(resp, StreamingResponse):
+        entry.finish()
+    return resp
+
+
+async def _route(
+    request: Request, path: str, body: bytes, body_str: str, payload, entry
+) -> Union[Response, StreamingResponse]:
+    """Resolve the model, apply the auth gate and dispatch. `payload` is the
+    already-parsed JSON body (a dict, or None for a non-JSON passthrough)."""
+    authorized = auth.is_authorized(request)
+    raw_model = payload.get("model") if payload is not None else None
+    is_stream = payload.get("stream", False) if payload is not None else False
 
     # No JSON model (e.g. non-chat passthrough): forward to the first provider
     # untouched, without slot gating.
@@ -681,9 +732,14 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
         provider = conf.PROVIDERS[0]
         if not authorized and provider.require_permission:
             return _unauthorized("")
+        # No slot is taken on this path, so it is never queued — running from the
+        # moment it is forwarded.
+        entry.run(provider.name, None)
         try:
             if is_stream:
-                return await _handle_stream(request, provider, path, body, body_str, "unknown")
+                return await _handle_stream(
+                    request, provider, path, body, body_str, "unknown", entry=entry
+                )
             return await _handle_non_stream(request, provider, path, body, body_str, "unknown")
         except httpx.RequestError as e:
             return _backend_error(provider, "unknown", e)
@@ -703,4 +759,4 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     healthy = [t for t in targets if not registry.is_down(t.provider)]
     candidates = healthy or targets
 
-    return await _dispatch(request, path, payload, is_stream, candidates)
+    return await _dispatch(request, path, payload, is_stream, candidates, entry)

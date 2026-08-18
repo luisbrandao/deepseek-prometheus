@@ -17,6 +17,8 @@ request a **clean model name** — the proxy decides *which* backend actually se
   and **queue** requests when every candidate is busy.
 - **Failover** — if a backend errors, the request retries the next one; offline
   backends drop out of the model list and are skipped.
+- **In-flight visibility** — the console's In-flight tab lists every request currently
+  running or queued, what each one is waiting on, and how long it has waited.
 - **Permission gate** — mark paid backends `require_permission: true`; only callers
   with a valid `Authorization: Bearer` key see or use them.
 - **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
@@ -261,8 +263,9 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
 | `/logging` | `GET` | Current `log_input` / `log_output` state |
 | `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
-| `/ui/` | `GET` | Web console (Logging / Models / Routing). Static, served by the proxy |
+| `/ui/` | `GET` | Web console (Logging / In-flight / Models / Routing). Static, served by the proxy |
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
+| `/admin/inflight` | `GET` | Snapshot of every request in flight (running + queued) with per-provider slot occupancy |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
 | `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
@@ -276,10 +279,18 @@ and never serialize provider `api_key`s.
 
 A built-in, dependency-free dashboard served by the proxy itself — open
 `http://<host>:9999/ui/` and paste a proxy key (stored in your browser's
-`localStorage`, sent as `Authorization: Bearer`). Three tabs:
+`localStorage`, sent as `Authorization: Bearer`). Four tabs:
 
 - **Logging** — live log tail (level filter, pause, autoscroll) plus the
   `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
+- **In-flight** — what the proxy is doing *right now*, polled every second: one row per
+  request, **queued ones first**. A running row shows the backend it landed on, the native
+  model id, and (for streams) a live chunk counter; a queued row shows the backends it is
+  waiting on and how long it has waited. Each row carries age / queued-for / running-for
+  timers, request body size, and who called (service from the `User-Agent`, plus IP and
+  reverse-DNS name). The toolbar totals running vs. queued and shows each provider's
+  `in_use/slots`, highlighted amber when full — so a growing queue can be read straight
+  against the capacity that is causing it. See [Slots, priority & queueing](#slots-priority--queueing).
 - **Models** — the aggregated catalog, plus a **Probe upstreams** button that queries
   each backend's real `/v1/models` so every endpoint's full list is visible at once
   (independent of `enabled_models`).

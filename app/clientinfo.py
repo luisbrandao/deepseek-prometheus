@@ -63,6 +63,20 @@ async def client_host(ip: str) -> Optional[str]:
         return None
 
 
+def cached_host(ip: str) -> Optional[str]:
+    """Reverse-DNS name for `ip` if it is already cached, else None.
+
+    A non-blocking peek, for callers that must never wait on a resolver — the
+    in-flight snapshot renders on every console poll. The per-request log's own
+    `client_host` lookup keeps the cache warm, so a repeat caller usually has a
+    name here anyway.
+    """
+    cached = _dns_cache.get(ip)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
+    return None
+
+
 def service_from_ua(ua: Optional[str]) -> Optional[str]:
     """Short service token from the User-Agent's leading product, e.g.
     'OpenWebUI/0.5 (extra)' -> 'OpenWebUI'. Heuristic, best-effort."""

@@ -22,6 +22,7 @@
 
   <nav class="tabs">
     <button class="tab active" data-tab="logging">Logging</button>
+    <button class="tab" data-tab="inflight">In-flight</button>
     <button class="tab" data-tab="models">Models</button>
     <button class="tab" data-tab="routing">Routing</button>
   </nav>
@@ -48,6 +49,21 @@
         <span id="log-count" class="muted"></span>
       </div>
       <div id="log-pane" class="logpane"></div>
+    </section>
+
+    <!-- ──────────────────────── IN-FLIGHT ──────────────────────── -->
+    <section id="tab-inflight" class="panel">
+      <div class="toolbar">
+        <span id="fl-summary" class="flsum"></span>
+        <span class="sep"></span>
+        <label class="switch"><input type="checkbox" id="fl-live" checked><span>Live</span></label>
+        <button id="fl-refresh" class="btn">Refresh</button>
+        <span class="grow"></span>
+        <span id="fl-slots" class="flslots"></span>
+      </div>
+      <div id="fl-body" class="flbody">
+        <div class="notice">Loading…</div>
+      </div>
     </section>
 
     <!-- ───────────────────────── MODELS ───────────────────────── -->

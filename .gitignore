@@ -6,3 +6,6 @@ config.yaml
 # Persisted metric state (lives on a mounted volume in production)
 data/
 metrics_state.json
+
+# Claude Code per-machine overrides (skills under .claude/skills/ are tracked)
+.claude/settings.local.json
