@@ -133,6 +133,27 @@ consistently high ratio of yields means the cap is too tight for your traffic). 
 In-flight tab marks a passed-over row `passed over N×` and shows each backend's resident
 model on its chip.
 
+**In Grafana:** import [`grafana-queue-dashboard.json`](grafana-queue-dashboard.json)
+(Dashboards → New → Import → paste the JSON, then pick your Prometheus datasource). Or
+query it directly:
+
+```promql
+# model loads avoided over the dashboard range
+sum(increase(llm_proxy_queue_affinity_grants_total[$__range])) or vector(0)
+
+# reorderings per minute, per backend
+sum by (provider) (rate(llm_proxy_queue_affinity_grants_total[$__rate_interval])) * 60
+
+# how often the starvation cap has to step in
+sum(increase(llm_proxy_queue_starvation_yields_total[$__range])) or vector(0)
+```
+
+The `or vector(0)` is not decoration: a labelled Prometheus counter does not exist until
+its first increment, so a panel for a cap that has never fired reads **No data** rather
+than zero — which looks like a broken dashboard. Note also that a counter's first ever
+sample cannot be an `increase()`, so a freshly created series shows 0 until it moves
+again.
+
 ### Failover
 
 If a chosen backend errors the proxy releases the slot, marks the backend down for
