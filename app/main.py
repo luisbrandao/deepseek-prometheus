@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import auth, configwrite, inflight, logbuffer, persistence, registry, slots
@@ -381,6 +381,33 @@ async def admin_cancel_inflight(request_id: int, request: Request):
     return {"id": entry.id, "status": "cancelled", "state": entry.state}
 
 
+@app.get("/admin/inflight/{request_id}/body")
+async def admin_inflight_body(request_id: int, request: Request):
+    """The prompt and reply captured for one row of the feed.
+
+    Deliberately not part of the snapshot: an agentic client's prompt runs to
+    hundreds of KiB, and the console polls every second. Fetched per row instead,
+    only when someone opens it.
+
+    404 covers three cases that are all "nothing to show": capture disabled
+    (`INFLIGHT_BODIES=false`), the row aged out of the history, or the request
+    carried no body at all.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    if not conf.INFLIGHT_BODIES:
+        return JSONResponse(
+            {"error": "body capture is disabled (INFLIGHT_BODIES=false)"}, status_code=404
+        )
+    rec = inflight.bodies(request_id)
+    if rec is None:
+        return JSONResponse(
+            {"error": f"no captured body for request {request_id}"}, status_code=404
+        )
+    return {"id": request_id, "limit": conf.INFLIGHT_BODY_LIMIT, **rec}
+
+
 @app.get("/admin/routing")
 async def admin_routing(request: Request):
     """The routing graph: providers (with live slot/health state), explicit
@@ -475,6 +502,30 @@ async def admin_set_routing(model: str, request: Request):
         "persisted": persisted,
         "persist_error": persist_error,
     }
+
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve a real icon instead of letting the browser's automatic request fall
+    through to the catch-all, where it was resolved as a *model* name: with no
+    JSON body it took the passthrough path, got auth-gated into a 401, and showed
+    up in the request feed as a failed request. Every browser asks for this on
+    every page load, so it was pure noise in the one view meant to be readable."""
+    return FileResponse(
+        os.path.join(_STATIC_DIR, "favicon.ico"),
+        media_type="image/vnd.microsoft.icon",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/robots.txt")
+async def robots():
+    """Same reasoning as the favicon: a crawler or browser probing this path is
+    not a model request. Nothing here should be indexed."""
+    return Response(content="User-agent: *\nDisallow: /\n", media_type="text/plain")
 
 
 # Convenience redirects to the dashboard. The StaticFiles mount only serves

@@ -322,11 +322,13 @@ async function probeUpstreams() {
  * then left alone; only the live ones tick. */
 let flightTimer = null;
 const flightRows = new Map(); // id -> row element
-// Kill needs two clicks: rows re-render every second and reorder as requests
-// change state, so a single-click kill is one stray click away from killing
-// someone's generation. Armed ids live here so the state survives a re-render.
-const killArmed = new Set();
 const killSent = new Set();
+// Rows whose request/response pane is open. Kept by id so the pane survives the
+// 1s re-render, and so reopening doesn't refetch what we already have.
+const bodyOpen = new Map();   // id -> {loading, data, error}
+// Built panes, cached by id: a live row re-renders every second and rebuilding an
+// unchanged pane each time would throw away the reader's scroll position.
+const bodyPanes = new Map();  // id -> {el, sig}
 let flightDivider = null;
 
 function startFlightPolling() {
@@ -368,7 +370,25 @@ async function pollFlight() {
     return;
   }
   if (!res.ok) return;
-  renderFlight(await res.json());
+  const data = await res.json();
+  renderFlight(data);
+  refreshOpenBodies(data);
+}
+
+// A pane open on a *live* row is watching a reply still being written, so re-pull
+// it (every other tick — 16 KiB per open pane per second would be wasteful).
+let bodyTick = 0;
+function refreshOpenBodies(data) {
+  if (!bodyOpen.size || ++bodyTick % 2) return;
+  const live = new Set((data.requests || []).filter((r) => r.live).map((r) => r.id));
+  for (const id of bodyOpen.keys()) {
+    const st = bodyOpen.get(id);
+    if (!live.has(id) || st.loading) continue;
+    api(`/admin/inflight/${id}/body`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((d) => { if (d && bodyOpen.has(id)) { bodyOpen.set(id, { data: d }); redrawRow(id); } })
+      .catch(() => {});
+  }
 }
 
 function renderFlight(data) {
@@ -402,8 +422,9 @@ function renderFlight(data) {
   const reqs = data.requests || [];
   if (!reqs.length) {
     flightRows.clear();
-    killArmed.clear();
     killSent.clear();
+    bodyOpen.clear();
+    bodyPanes.clear();
     flightDivider = null;
     body.innerHTML = '<div class="notice">Nothing in flight yet — requests appear here as they arrive.</div>';
     return;
@@ -446,8 +467,9 @@ function renderFlight(data) {
     if (!seen.has(id)) {
       row.remove();
       flightRows.delete(id);
-      killArmed.delete(id);
       killSent.delete(id);
+      bodyOpen.delete(id);
+      bodyPanes.delete(id);
     }
   }
   if (flightDivider && !items.includes(null)) { flightDivider.remove(); flightDivider = null; }
@@ -458,8 +480,9 @@ function renderFlight(data) {
 function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
-    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.client_host,
-    killArmed.has(r.id), killSent.has(r.id),
+    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.estimated,
+    r.client_host, r.has_body, killSent.has(r.id),
+    JSON.stringify(bodyOpen.get(r.id) || null),
   ].join("\u0001");
 }
 
@@ -526,47 +549,126 @@ function fillFlightRow(row, r) {
   // Every row in a group gets the same cells — a stream-only column would make
   // the numbers jump left and right down the list.
   const times = el("div", "fltimes");
+  // Live out-tokens are our own count of generation steps — the upstream only
+  // reports usage in its final chunk — so they carry a ~ until the real number
+  // lands. Input tokens simply aren't knowable before then.
+  const tokIn = r.in_tokens == null ? (r.live ? "0" : "—") : String(r.in_tokens);
+  const tokOut = r.out_tokens == null
+    ? (r.live ? "0" : "—")
+    : (r.estimated ? "~" + r.out_tokens : String(r.out_tokens));
   if (r.live) {
     times.appendChild(timeCell("age", dur(r.age)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
     times.appendChild(timeCell("running", dur(r.running_for)));
+    times.appendChild(timeCell("tok in", tokIn));
+    times.appendChild(timeCell("tok out", tokOut));
   } else {
     times.appendChild(timeCell("took", dur(r.duration)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
-    times.appendChild(timeCell("tok in", r.in_tokens == null ? "—" : String(r.in_tokens)));
-    times.appendChild(timeCell("tok out", r.out_tokens == null ? "—" : String(r.out_tokens)));
+    times.appendChild(timeCell("tok in", tokIn));
+    times.appendChild(timeCell("tok out", tokOut));
   }
   times.appendChild(timeCell("chunks", r.stream ? String(r.chunks == null ? "—" : r.chunks) : "—"));
   times.appendChild(timeCell("body", bytes(r.req_bytes)));
   row.appendChild(times);
 
+  if (r.has_body) {
+    const open = bodyOpen.has(r.id);
+    const peek = el("button", "btn peek" + (open ? " on" : ""), open ? "Hide" : "Body");
+    peek.title = "show the prompt this request sent and the reply so far";
+    peek.onclick = () => toggleBody(r.id);
+    row.appendChild(peek);
+  } else {
+    row.appendChild(el("span", "flnopeek"));
+  }
+
   // Only a live request can be killed; a finished row keeps the column aligned.
   if (!r.live) {
     row.appendChild(el("span", "flnokill"));
+    if (bodyOpen.has(r.id)) row.appendChild(bodyPane(r.id));
     return;
   }
 
-  const armed = killArmed.has(r.id);
   const sent = killSent.has(r.id) || r.cancelled;
-  const kill = el("button", "btn kill" + (armed ? " armed" : ""), sent ? "killing…" : armed ? "Sure?" : "Kill");
+  const kill = el("button", "btn kill", sent ? "killing…" : "Kill");
   kill.disabled = sent;
   kill.title = sent
     ? "cancellation sent — the row turns into a 'cancelled' history entry once it unwinds"
-    : armed
-      ? "click again to cancel this request"
-      : "cancel this request — the client gets a 503";
-  kill.onclick = () => {
-    if (killArmed.has(r.id)) { killArmed.delete(r.id); killFlight(r.id); return; }
-    killArmed.add(r.id);
-    fillFlightRow(row, r);
-    // Disarm on its own, so a stray first click doesn't stay live indefinitely.
-    setTimeout(() => {
-      if (!killArmed.delete(r.id)) return;
-      const still = flightRows.get(r.id);
-      if (still && still._r) fillFlightRow(still, still._r);
-    }, 4000);
-  };
+    : "cancel this request — the client gets a 503";
+  kill.onclick = () => killFlight(r.id);
   row.appendChild(kill);
+  if (bodyOpen.has(r.id)) row.appendChild(bodyPane(r.id));
+}
+
+/* ── In-flight: the request/response pane ──────────────────── */
+async function toggleBody(id) {
+  if (bodyOpen.has(id)) {
+    bodyOpen.delete(id);
+    bodyPanes.delete(id);
+    redrawRow(id);
+    return;
+  }
+  bodyOpen.set(id, { loading: true });
+  redrawRow(id);
+  try {
+    const res = await api(`/admin/inflight/${id}/body`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      bodyOpen.set(id, { error: err.error || `HTTP ${res.status}` });
+    } else {
+      bodyOpen.set(id, { data: await res.json() });
+    }
+  } catch {
+    bodyOpen.set(id, { error: "cannot reach the proxy" });
+  }
+  redrawRow(id);
+}
+
+function redrawRow(id) {
+  const row = flightRows.get(id);
+  if (row && row._r) { row._sig = null; fillFlightRow(row, row._r); }
+}
+
+// Pretty-print when it's JSON, leave it alone when it isn't.
+function maybeJson(text) {
+  const t = (text || "").trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return text;
+  try { return JSON.stringify(JSON.parse(t), null, 2); } catch { return text; }
+}
+
+function bodyPane(id) {
+  const st = bodyOpen.get(id) || {};
+  const sig = JSON.stringify(st);
+  const cached = bodyPanes.get(id);
+  if (cached && cached.sig === sig) return cached.el;
+  const pane = buildBodyPane(st);
+  bodyPanes.set(id, { el: pane, sig });
+  return pane;
+}
+
+function buildBodyPane(st) {
+  const pane = el("div", "flbodypane");
+  if (st.loading) { pane.appendChild(el("div", "muted", "loading…")); return pane; }
+  if (st.error) { pane.appendChild(el("div", "uerr", st.error)); return pane; }
+  const d = st.data || {};
+  const section = (label, text, truncated) => {
+    if (!text) return;
+    const h = el("div", "flbodyhead", label);
+    if (truncated) {
+      const t = el("span", "fltag warn", "truncated at " + bytes(d.limit));
+      t.title = "raise INFLIGHT_BODY_LIMIT to keep more";
+      h.appendChild(t);
+    }
+    const pre = el("pre", "flbodytext", text);
+    pane.append(h, pre);
+  };
+  section("request", maybeJson(d.request), d.request_truncated);
+  section("reasoning", d.reasoning, d.reasoning_truncated);
+  section("response", maybeJson(d.response), d.response_truncated);
+  if (!d.request && !d.response && !d.reasoning) {
+    pane.appendChild(el("div", "muted", "nothing captured for this request"));
+  }
+  return pane;
 }
 
 async function killFlight(id) {

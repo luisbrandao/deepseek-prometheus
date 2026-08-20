@@ -343,6 +343,7 @@ async def _handle_non_stream(
 
     if entry is not None:
         entry.record(status_code, in_tokens, out_tokens)
+        entry.add_response(resp_body)
 
     resp_headers.pop("content-length", None)
     resp_headers.pop("transfer-encoding", None)
@@ -413,6 +414,7 @@ async def _handle_stream(
         resp_body = _decompress(raw, content_encoding).decode("utf-8", errors="replace")
         if entry is not None:
             entry.record(status_code)
+            entry.add_response(resp_body)
         _log_upstream_error(pname, model, status_code, resp_body)
         if model != "unknown":
             ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
@@ -467,16 +469,21 @@ async def _handle_stream(
                             in_tokens = usage.get("prompt_tokens", in_tokens)
                             out_tokens = usage.get("completion_tokens", out_tokens)
                             final_chunk = data
+                        choices = data.get("choices") or []
+                        delta = choices[0].get("delta") or {} if choices else {}
+                        content = delta.get("content") or ""
+                        reasoning = delta.get("reasoning_content") or ""
+                        if entry is not None and (content or reasoning):
+                            # One delta carrying text == one generation step. The
+                            # only live token signal there is; see Entry.token.
+                            entry.token()
+                            entry.add_response(content)
+                            entry.add_response(reasoning, reasoning=True)
                         if delta_contents is not None:
-                            choices = data.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                reasoning = delta.get("reasoning_content")
-                                if content:
-                                    delta_contents.append(content)
-                                if reasoning:
-                                    reasoning_contents.append(reasoning)
+                            if content:
+                                delta_contents.append(content)
+                            if reasoning:
+                                reasoning_contents.append(reasoning)
                     except json.JSONDecodeError:
                         pass
         except asyncio.CancelledError:
@@ -761,6 +768,7 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
         client_ip=clientinfo.client_ip(request),
         svc=clientinfo.service_from_ua(ua),
     )
+    entry.set_request(body_str)
     try:
         resp = await _route(request, path, body, body_str, payload, entry)
     except asyncio.CancelledError:

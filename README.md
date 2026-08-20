@@ -266,6 +266,8 @@ Set in `docker-compose.yml` — **not** in `config.yaml`:
 | `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for a reverse-DNS lookup before logging IP-only |
 | `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For` / `X-Real-IP` for the caller IP (set `false` behind no proxy) |
 | `INFLIGHT_HISTORY` | `200` | Finished requests the In-flight tab keeps below the live ones (in-memory, lost on restart) |
+| `INFLIGHT_BODIES` | `true` | Attach each request's prompt + reply to its In-flight row. **Holds prompt text in memory** (bounded, never written to disk or stdout, admin-gated); `false` keeps the feed metadata-only |
+| `INFLIGHT_BODY_LIMIT` | `16384` | Bytes kept per side (request / reasoning / response) before truncating |
 
 > **Single worker required.** Slot/queue accounting is in-process, so run **one**
 > uvicorn worker (the default). Multiple workers would split the accounting and break
@@ -308,6 +310,8 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
 | `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
+| `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
+| `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
 | `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
@@ -328,19 +332,31 @@ A built-in, dependency-free dashboard served by the proxy itself — open
 - **In-flight** — what the proxy is doing *right now*, polled every second, as a rolling
   feed: **live requests pinned on top** (newest first), then the recently finished ones
   below a divider. Every row is numbered with the request id.
-  - A **running** row shows the backend it landed on, the native model id, and — for
-    streams — a chunk counter that ticks as tokens arrive. A **queued** row shows which
-    backends it is waiting on and for how long. Both carry age / queued-for / running-for.
+  - A **running** row shows the backend it landed on, the native model id, live token
+    counts, and — for streams — a chunk counter that ticks as tokens arrive. A **queued**
+    row shows which backends it is waiting on and for how long. Both carry age /
+    queued-for / running-for.
+  - **Live token counts** come with a caveat worth knowing: an upstream reports `usage`
+    only in its *final* streaming chunk (verified against llama.cpp — 1 chunk in 33), so
+    while a request runs, `tok out` is the proxy's own count of generation steps, shown as
+    `~40`, and is replaced by the authoritative number the instant usage arrives. `tok in`
+    is genuinely unknowable before then and reads `0`. A buffered (non-streaming) request
+    reveals nothing until it returns, so both read `0` while it runs.
   - A **finished** row is frozen at completion with its status, total time, queue wait and
     token counts (`done` / `cancelled` / `failed`, colour-coded). History is capped by
     `INFLIGHT_HISTORY` and is lost on restart by design — the durable per-request record is
     the `event=request` log line.
   - Every row shows who called (service from the `User-Agent`, plus IP and reverse-DNS name)
     and the request body size.
-  - **Kill** cancels a live request — two clicks, since rows reorder as state changes. Works
-    on a queued request *and* on one wedged in an upstream read that will never return; the
-    slot is freed immediately and the caller gets a `503`. See
-    [Killing a request](#killing-a-request).
+  - **Body** expands the row to show the prompt this request sent and the reply that came
+    back — pretty-printed, with a thinking model's reasoning kept separate from its answer.
+    On a running request the reply fills in as it streams. This is the reason it exists:
+    reading one request end-to-end here beats grepping it out of a log stream that also
+    carries every `/metrics` scrape. Bodies are fetched per row on demand, never in the
+    1s poll.
+  - **Kill** cancels a live request, on a single click. Works on a queued request *and* on
+    one wedged in an upstream read that will never return; the slot is freed immediately
+    and the caller gets a `503`. See [Killing a request](#killing-a-request).
   - The toolbar totals running / queued / done and shows each provider's `in_use/slots`,
     amber when full — so a growing queue reads straight against the capacity causing it.
     See [Slots, priority & queueing](#slots-priority--queueing).

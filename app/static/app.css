@@ -289,17 +289,42 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 .fllabel { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .flvalue { font-family: var(--mono); font-size: 12px; }
 
-/* Kill button: understated until armed, then unmistakably red. */
+/* The pane drops onto its own line below the row (the row is a flex line). */
+.flrow { flex-wrap: wrap; }
+.flbodypane {
+  flex: 0 0 100%; margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--line); max-height: 340px; overflow-y: auto;
+}
+.flbodyhead {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .7px;
+  color: var(--muted); margin: 8px 0 4px;
+}
+.flbodyhead:first-child { margin-top: 0; }
+.flbodytext {
+  margin: 0; padding: 8px 10px; background: #0b0e12;
+  border: 1px solid var(--line); border-radius: 7px;
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; color: var(--text);
+  max-height: 220px; overflow-y: auto;
+}
+
+.btn.peek {
+  flex: 0 0 auto; padding: 5px 11px; font-size: 12px;
+  border-color: var(--line-2); color: var(--muted);
+}
+.btn.peek:hover { color: var(--text); border-color: var(--accent-2); }
+.btn.peek.on { background: var(--bg-3); color: var(--accent); border-color: var(--accent-2); }
+.flnopeek { flex: 0 0 auto; width: 57px; }
+
+/* Kill fires on a single click, so hover has to make the intent unmistakable. */
 .btn.kill {
   flex: 0 0 auto; padding: 5px 11px; font-size: 12px;
   border-color: var(--line-2); color: var(--muted);
 }
-.btn.kill:hover { color: #ffb9af; border-color: rgba(229,96,77,.55); background: rgba(229,96,77,.10); }
-.btn.kill.armed {
-  background: var(--red); border-color: var(--red); color: #fff; font-weight: 600;
-}
-.btn.kill.armed:hover { background: #f0705c; }
+.btn.kill:hover { color: #fff; background: var(--red); border-color: var(--red); font-weight: 600; }
 .btn.kill:disabled { opacity: .6; color: var(--muted); background: var(--bg-3); }
+.btn.kill:disabled:hover { background: var(--bg-3); border-color: var(--line-2); font-weight: 400; }
 
 @media (max-width: 880px) {
   .flrow { flex-wrap: wrap; }

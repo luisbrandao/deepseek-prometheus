@@ -18,7 +18,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout, on_skip)` / `release(provider, model)` / `poke()`. Priority admission (round-robin within a tie tier), then an **explicit** queue of `_Waiter` futures with model-affinity reordering. Also `in_use`/`resident_model`/`queue_depth` for introspection. |
-| `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, and `Entry.cancel()` for the Kill button. Observation only apart from `cancel` — nothing in the *request path* reads it. |
+| `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/token/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, `Entry.cancel()` for the Kill button, and a separate bounded `_bodies` store (`set_request`/`add_response`/`bodies()`) read only by `/admin/inflight/{id}/body`. Observation only apart from `cancel` — nothing in the *request path* reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
@@ -95,7 +95,17 @@ decompresses the response. Single process, async, one uvicorn worker.
   `LOGICAL_MODELS[*].targets` priorities in place and must re-`sort` the target list
   afterwards, or the priority-tier `groupby` in `slots._pick_free` breaks. Routes +
   the `/ui` mount live **above** the catch-all in `main.py` so they win over the
-  proxy path.
+  proxy path. `/favicon.ico` and `/robots.txt` are there for the same reason and are
+  not cosmetic: without them a browser's automatic favicon request falls into the
+  catch-all, is treated as a model-less passthrough, 401s, and lands in the request
+  feed as a failed request on every page load. Any other well-known browser path
+  belongs there too.
+- **Body capture is bounded and never leaves the process.** `_bodies` is capped per
+  side (`INFLIGHT_BODY_LIMIT`) and evicted with the history, because an agentic
+  client's prompt is routinely hundreds of KiB. It must stay out of `snapshot()` —
+  the console polls that every second — and out of stdout, which is what separates it
+  from `LOG_INPUT`/`LOG_OUTPUT`: those go to the log shipper, this does not. It is
+  auth-gated like every other `/admin/*` route because it holds prompt text.
 - **Config write-back (`configwrite.py`).** Persisting a routing edit rewrites ONLY
   the `priority: N` digits of the matched flow-style target lines; never re-emit the
   file through a YAML dumper (comments/format must survive — the config is

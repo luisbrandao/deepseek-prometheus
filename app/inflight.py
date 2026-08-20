@@ -58,6 +58,11 @@ _active: dict = {}
 # Frozen snapshots of finished requests, newest first (appendleft). Bounded, so a
 # busy proxy cannot grow this without limit.
 _recent: deque = deque(maxlen=max(1, conf.INFLIGHT_HISTORY))
+# id -> {"request", "response", "reasoning", ...}: the prompt and reply for a row,
+# kept out of `_active`/`_recent` so the console's 1s poll never carries them.
+# Fetched per row, on demand, from /admin/inflight/{id}/body. Bounded to roughly
+# the history size — bodies are the one part of an entry big enough to matter.
+_bodies: dict = {}
 
 
 class Entry:
@@ -69,7 +74,7 @@ class Entry:
         "method", "path", "req_bytes", "client_ip", "svc", "provider",
         "native_model", "candidates", "attempt", "slot_at", "chunks",
         "task", "stream_task", "cancelled", "status", "in_tokens", "out_tokens",
-        "skipped",
+        "skipped", "estimated",
     )
 
     def __init__(self, model, stream, op, method, path, req_bytes, client_ip, svc):
@@ -107,6 +112,9 @@ class Entry:
         self.status = None
         self.in_tokens = None
         self.out_tokens = None
+        # True while out_tokens is our own live count rather than the upstream's
+        # reported usage, so the console can render it as approximate.
+        self.estimated = False
 
     def wait(self, targets) -> None:
         """Waiting for a slot: the initial admission, or a re-queue after a
@@ -135,9 +143,22 @@ class Entry:
 
     def chunk(self) -> None:
         """Count one SSE `data:` event, so a streaming row shows visible progress
-        instead of a frozen elapsed timer. Deliberately a chunk count, not a token
-        count: the upstream only reports usage in its final chunk."""
+        instead of a frozen elapsed timer."""
         self.chunks += 1
+
+    def token(self) -> None:
+        """Count one generated token, live.
+
+        The upstream reports `usage` only in its final chunk (verified against
+        llama.cpp: 1 of 33 chunks), so a running row would otherwise show nothing
+        until it finished. Each delta carrying content or reasoning text is one
+        generation step, which tracks the reported completion_tokens closely — but
+        it is our count, not theirs, so it is flagged `estimated` and replaced by
+        the real number the moment usage arrives. Input tokens cannot be known
+        early at all: nothing upstream reveals the prompt count until the end.
+        """
+        self.out_tokens = (self.out_tokens or 0) + 1
+        self.estimated = True
 
     def record(self, status: int, in_tokens: int = 0, out_tokens: int = 0) -> None:
         """Note the outcome, from whichever handler saw the upstream response.
@@ -145,10 +166,47 @@ class Entry:
         Called before `finish`, so the history row carries the real status and
         token counts instead of just "it ended". A failover records once per
         attempt; last write wins, which is the attempt the client actually got.
+
+        Reported usage supersedes the live estimate — but only when it says
+        something. A backend that never sends usage reports 0 here, and zeroing a
+        count we watched tick up would be strictly worse information, so a 0 keeps
+        the estimate (and its flag).
         """
         self.status = status
-        self.in_tokens = in_tokens
-        self.out_tokens = out_tokens
+        if in_tokens:
+            self.in_tokens = in_tokens
+        if out_tokens:
+            self.out_tokens = out_tokens
+            self.estimated = False
+
+    def set_request(self, body_str: str) -> None:
+        """Attach the prompt this request sent, truncated to INFLIGHT_BODY_LIMIT."""
+        if not conf.INFLIGHT_BODIES:
+            return
+        rec = _body_record(self.id)
+        rec["request"], rec["request_truncated"] = _clip(body_str)
+
+    def add_response(self, text: str, reasoning: bool = False) -> None:
+        """Append to the reply captured for this row — one call per streamed delta,
+        or one call with the whole body for a buffered response.
+
+        Reasoning text is kept apart from the answer: on a thinking model the two
+        interleave in the stream and reading them merged is worse than either.
+        Stops appending at the cap instead of growing (a long generation would
+        otherwise be unbounded), and does no formatting work once full.
+        """
+        if not conf.INFLIGHT_BODIES or not text:
+            return
+        rec = _body_record(self.id)
+        key = "reasoning" if reasoning else "response"
+        current = rec[key]
+        room = conf.INFLIGHT_BODY_LIMIT - len(current)
+        if room <= 0:
+            rec[key + "_truncated"] = True
+            return
+        rec[key] = current + text[:room]
+        if len(text) > room:
+            rec[key + "_truncated"] = True
 
     def bind_stream(self) -> None:
         """Record the task that pumps the SSE body, called from the generator.
@@ -247,6 +305,8 @@ class Entry:
             # Only meaningful once the upstream reported usage, i.e. at the end.
             "in_tokens": self.in_tokens,
             "out_tokens": self.out_tokens,
+            "estimated": self.estimated,
+            "has_body": self.id in _bodies,
             "cancelled": self.cancelled,
             "client_ip": self.client_ip,
             # Peeked from the cache the per-request log keeps warm — never a
@@ -254,6 +314,44 @@ class Entry:
             "client_host": clientinfo.cached_host(self.client_ip),
             "svc": self.svc,
         }
+
+
+def _clip(text: str):
+    """`(text, was_truncated)` clipped to the configured per-side cap."""
+    limit = conf.INFLIGHT_BODY_LIMIT
+    if text is None:
+        return "", False
+    if len(text) <= limit:
+        return text, False
+    return text[:limit], True
+
+
+def _body_record(entry_id: int) -> dict:
+    """The body record for `entry_id`, creating it on first write.
+
+    Eviction is keyed to the history: once a row has aged out of `_recent` its
+    bodies are unreachable from the console anyway, so anything older than the
+    newest INFLIGHT_HISTORY ids is dropped. Insertion-ordered dict, so the oldest
+    keys are simply the first ones.
+    """
+    rec = _bodies.get(entry_id)
+    if rec is None:
+        rec = {
+            "request": "", "request_truncated": False,
+            "response": "", "response_truncated": False,
+            "reasoning": "", "reasoning_truncated": False,
+        }
+        _bodies[entry_id] = rec
+        limit = max(1, conf.INFLIGHT_HISTORY)
+        while len(_bodies) > limit:
+            _bodies.pop(next(iter(_bodies)))
+    return rec
+
+
+def bodies(entry_id: int):
+    """Captured prompt/reply for one row, or None if nothing was captured (body
+    capture off, or the row has aged out)."""
+    return _bodies.get(entry_id)
 
 
 def begin(*, model, stream, op, method, path, req_bytes, client_ip, svc) -> Entry:

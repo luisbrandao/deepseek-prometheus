@@ -302,6 +302,17 @@ TRUST_PROXY_HEADERS = _flag("TRUST_PROXY_HEADERS", "true")
 # design; Loki has the durable copy of the per-request event log.
 INFLIGHT_HISTORY = int(os.environ.get("INFLIGHT_HISTORY", "200"))
 
+# Keep each request's prompt and the model's reply attached to its In-flight row,
+# so a single request can be read without grepping it out of the log stream.
+# **This captures prompt text in memory by default** (bounded, never written to
+# disk, gone on restart, and only readable through the auth-gated admin API) —
+# set INFLIGHT_BODIES=false to keep the feed metadata-only. Unlike LOG_INPUT /
+# LOG_OUTPUT this never reaches stdout, so it stays out of the log shipper.
+INFLIGHT_BODIES = _flag("INFLIGHT_BODIES", "true")
+# Per-side cap in bytes. A 170 KiB prompt is ordinary for an agentic client, so
+# bodies are truncated head-first rather than stored whole.
+INFLIGHT_BODY_LIMIT = int(os.environ.get("INFLIGHT_BODY_LIMIT", "16384"))
+
 # Optional metric persistence: snapshot cumulative counters to disk and restore
 # them on boot so Prometheus deltas stay continuous across restarts. The path
 # must live on a volume that survives pod recreation to be useful.
