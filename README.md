@@ -65,7 +65,23 @@ supplies the native id. See [Canonical names](#canonical-names).
 3. **Logical model** — a `models:` entry mapping one canonical name to several prioritized targets.
 4. **Auto-group** — the same canonical name served by multiple backends is load-balanced
    automatically, ordered by each backend's `priority` (no config needed).
-5. **Fallback** — first backend whose `enabled_models` serves it, else the first backend.
+5. **Allow-listed backend** — a backend whose `enabled_models` names it explicitly.
+
+If none of those match, the request gets a **404 `model_not_found`** — the proxy never
+picks a backend on the client's behalf:
+
+```json
+{"error": {"message": "The model 'x' does not exist or is not available on this proxy",
+           "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}
+```
+
+> **This used to be a last-resort guess** — an unresolved name was sent to whichever
+> backend was listed *first* in the config. That looked like graceful degradation and was
+> a trap. If the first backend is `require_permission`, a caller with no key asking for a
+> **free local model** got `401 Model 'x' requires authentication` — an auth error about a
+> backend they never chose and cannot see. It happened in production, intermittently,
+> whenever live discovery blipped (see below), and was unexplainable from the client side.
+> A model nothing is known to serve now says exactly that.
 
 ### Slots, priority & queueing
 
@@ -414,7 +430,14 @@ fronts is **hidden** — both its canonical name and the concrete native ids of 
 so clients use the stable logical name instead, and per-backend variants (e.g. quantizations)
 don't flap in and out of the list as backends come and go. Live-discovered backends are queried (`GET {base_url}/v1/models`),
 cached for `cache_ttl`, coalesced via single-flight so a burst of cold requests triggers one
-probe per backend; offline backends drop out. Gated backends are hidden from callers
+probe per backend; offline backends drop out.
+
+**A failed probe does not blank a backend.** A local backend busy loading a model can miss
+its `/v1/models` window, and treating that as "this box has no models" made every model on
+it unresolvable for a full `cache_ttl`. Instead the last catalog that *did* succeed stands
+in for up to 5 minutes (`registry.STALE_GRACE`), re-probing every 15s while it does, and is
+logged each time. Past that window a backend that is still failing really is gone and its
+models drop out of the listing. Gated backends are hidden from callers
 without a valid key.
 
 ## Prometheus Metrics

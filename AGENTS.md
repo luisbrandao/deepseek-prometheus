@@ -16,7 +16,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | File | Responsibility |
 |---|---|
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
-| `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
+| `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → allow-listed provider. Returns `[]` when nothing serves the model — **never** a guessed backend. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout, on_skip)` / `release(provider, model)` / `poke()`. Priority admission (round-robin within a tie tier), then an **explicit** queue of `_Waiter` futures with model-affinity reordering. Also `in_use`/`resident_model`/`queue_depth` for introspection. |
 | `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/token/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, `Entry.cancel()` for the Kill button, and a separate bounded `_bodies` store (`set_request`/`add_response`/`bodies()`) read only by `/admin/inflight/{id}/body`. Observation only apart from `cancel` — nothing in the *request path* reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
@@ -88,6 +88,21 @@ decompresses the response. Single process, async, one uvicorn worker.
   `Accept-Encoding` is capped to `gzip, deflate` in `_build_headers`. Keep these aligned.
 - **Auth gate consistency.** Any new model-listing or routing path must apply the same
   `require_permission` filtering as `registry.list_models` and `proxy_request`.
+- **Never substitute a backend the client didn't ask for.** `router.resolve` returning `[]`
+  means "nothing serves this model" and must become a 404 (`proxy._model_not_found`), not a
+  fallback to `PROVIDERS[0]`. That fallback existed and caused a production bug: an
+  unauthenticated caller requesting a free local model, during a live-discovery blip, was
+  routed to the first-listed backend — a `require_permission` one — and received a 401
+  about a model they never asked for and cannot see. The same rule applies to the
+  model-less passthrough path, which must pick the first backend the *caller is permitted
+  to use*, not the first configured one. When resolution is uncertain, fail loudly; a wrong
+  backend produces an error that cannot be diagnosed from the client side.
+- **Discovery failure ≠ empty catalog.** `registry._cached_live` keeps the last successful
+  catalog for `STALE_GRACE` when a probe fails (re-probing every `STALE_RETRY`), because a
+  backend mid-model-swap misses its probe window routinely. Caching `[]` on failure made
+  every model on that backend unresolvable for a full `cache_ttl` — which is what triggered
+  the bug above. `clear_cache()` drops the last-known catalogs too, since a config reload
+  may have repointed `base_url`.
 - **Admin surface (`/admin/*`, `/ui`).** Every `/admin/*` endpoint is gated by
   `auth.is_authorized` (the log buffer can hold request/response bodies once
   `LOG_INPUT`/`LOG_OUTPUT` are on). Provider serialization must **never** include

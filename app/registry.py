@@ -16,6 +16,24 @@ PROBE_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 # provider name -> (expires_at_epoch, [model_id, ...])
 _cache = {}
 
+# provider name -> (fetched_at_epoch, [model_id, ...]) for the last probe that
+# actually succeeded, used to ride out a failing one.
+_last_good = {}
+
+# How long a provider's last successful catalog stands in for a failing probe.
+# A local backend mid-model-swap, or one momentary timeout, must not blank its
+# entire model list: that made every model on that box unresolvable for a full
+# cache_ttl — and until the router stopped guessing, sent those requests to
+# whichever backend happened to be first in the config. After the grace window a
+# backend that is still failing really is gone, and its models drop out.
+STALE_GRACE = 300.0
+
+# Re-probe interval while serving a stale catalog. Deliberately shorter than
+# cache_ttl: we are knowingly serving something we could not confirm, so we want
+# to correct it quickly — but not on every request, which would hammer a dead
+# backend.
+STALE_RETRY = 15.0
+
 # provider name -> asyncio.Lock, created lazily so each binds to the running
 # loop. Coalesces concurrent cold-cache misses into a single upstream probe
 # (single-flight) instead of letting every in-flight request fetch in parallel.
@@ -38,8 +56,14 @@ _down_until = {}
 def clear_cache() -> None:
     """Drop every cached live-discovery list. Called after a config reload:
     a provider's base_url / enabled_models / cache_ttl may have changed, so
-    the next request re-probes instead of serving a list from the old config."""
+    the next request re-probes instead of serving a list from the old config.
+
+    The last-known-good catalogs go too — a changed base_url points somewhere
+    else entirely, and a stale list from the previous endpoint would be worse
+    than no list at all.
+    """
     _cache.clear()
+    _last_good.clear()
 
 
 def mark_down(provider_name: str, seconds: float) -> None:
@@ -86,16 +110,32 @@ async def _cached_live(provider: conf.Provider):
             return entry[1]
         try:
             ids = await _fetch_live(provider)
+            _last_good[provider.name] = (time.time(), ids)
+            ttl = provider.cache_ttl
         except Exception as e:
-            # Backend is unreachable: drop its models from the listing. Backends
-            # are expected to come and go, so this is not an error condition.
-            logger.warning(f"Failed to fetch models from {provider.name}: {e}")
-            ids = []
-        # Stamp expiry AFTER the probe (which may have been slow), so a failed
-        # probe is still cached for the full ttl and we don't re-hit a dead
-        # backend on every request. Once the box is back, the next miss
-        # re-discovers it.
-        _cache[provider.name] = (time.time() + provider.cache_ttl, ids)
+            # Probe failed. Prefer this backend's last known catalog over
+            # declaring it modelless: a swap-induced timeout is far more common
+            # than a box actually losing its models, and blanking the list makes
+            # every model on it unresolvable (see STALE_GRACE). Re-probe sooner
+            # than usual while we are serving something unconfirmed.
+            stale = _last_good.get(provider.name)
+            if stale and time.time() - stale[0] <= STALE_GRACE:
+                ids = stale[1]
+                ttl = min(provider.cache_ttl, STALE_RETRY)
+                logger.warning(
+                    "Model discovery failed for %s (%s: %s); serving its last known "
+                    "catalog of %d model(s) and re-probing in %.0fs",
+                    provider.name, type(e).__name__, e, len(ids), ttl,
+                )
+            else:
+                # Never seen a catalog, or the last one is too old to trust.
+                # Backends are expected to come and go, so this is not an error.
+                logger.warning(f"Failed to fetch models from {provider.name}: {e}")
+                ids = []
+                ttl = provider.cache_ttl
+        # Stamp expiry AFTER the probe (which may have been slow), so we don't
+        # re-hit a slow backend on every request.
+        _cache[provider.name] = (time.time() + ttl, ids)
         return ids
 
 

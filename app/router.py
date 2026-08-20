@@ -60,16 +60,24 @@ async def _auto_group(raw: str):
     return targets
 
 
-def _fallback(raw: str):
-    """First provider whose allow-list serves the canonical model, else the first
-    configured provider. The wire id is the provider's native mapping."""
+def _allow_listed(raw: str):
+    """First provider whose `enabled_models` explicitly serves this canonical
+    model. The wire id is that provider's native mapping.
+
+    There is deliberately **no** last-resort guess after this. Sending an
+    unresolved model to `PROVIDERS[0]` used to look like graceful degradation and
+    was in fact a trap: a caller asking for a local model during a momentary
+    discovery blip got silently routed to whichever backend happened to be first
+    in the config. If that backend is `require_permission`, an unauthenticated
+    caller — who can neither see nor use it — receives a *401 about a model they
+    never asked for*. That is unexplainable from the client side, and it happened
+    in production. A model nothing is known to serve now resolves to nothing, and
+    the caller gets a straight 404 (see `proxy._model_not_found`).
+    """
     for p in conf.PROVIDERS:
         native = p.to_native(raw)
         if native in p.enabled_models:
             return [conf.Target(p.name, native, p.priority)]
-    if conf.PROVIDERS:
-        p = conf.PROVIDERS[0]
-        return [conf.Target(p.name, p.to_native(raw), p.priority)]
     return []
 
 
@@ -77,7 +85,11 @@ async def resolve(raw_model: str) -> List[conf.Target]:
     """Resolve a client-supplied model name into prioritized targets.
 
     Order: alias expansion -> explicit `provider:model` -> explicit `models:`
-    entry -> auto-grouped identical ids -> single-provider fallback.
+    entry -> auto-grouped identical ids -> allow-listed single provider.
+
+    Returns an empty list when no backend is known to serve the model. Callers
+    must treat that as "not available" and must not substitute a backend of their
+    own choosing; see `_allow_listed` for what that used to cost.
     """
     raw = conf.ALIASES.get(raw_model, raw_model)
 
@@ -94,4 +106,4 @@ async def resolve(raw_model: str) -> List[conf.Target]:
         if grouped:
             return grouped
 
-    return _fallback(raw)
+    return _allow_listed(raw)

@@ -723,6 +723,35 @@ def _cancelled_response() -> Response:
     return Response(content=json.dumps(payload), status_code=503, media_type="application/json")
 
 
+def _model_not_found(model: str, request: Request) -> Response:
+    """404 for a model no backend is known to serve.
+
+    Shaped like OpenAI's own unknown-model error (`invalid_request_error` /
+    `model_not_found`) so off-the-shelf clients surface the message instead of
+    showing a bare failure. Logged with the caller, because the interesting
+    question is always *who* asked for a name the proxy doesn't have — a typo, a
+    stale client-side model list, or a backend that dropped out of discovery.
+    """
+    ip = clientinfo.client_ip(request)
+    ua = (request.headers.get("user-agent") or "").strip() or None
+    logger.warning(
+        "Model '%s' is not available — no backend serves it (client %s, svc %s). "
+        "Returning 404 rather than guessing a backend.",
+        model, ip, clientinfo.service_from_ua(ua),
+    )
+    payload = {
+        "error": {
+            "message": (
+                f"The model '{model}' does not exist or is not available on this proxy"
+            ),
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_found",
+        }
+    }
+    return Response(content=json.dumps(payload), status_code=404, media_type="application/json")
+
+
 def _unauthorized(model: str) -> Response:
     payload = {
         "error": {
@@ -804,12 +833,18 @@ async def _route(
     is_stream = payload.get("stream", False) if payload is not None else False
 
     # No JSON model (e.g. non-chat passthrough): forward to the first provider
-    # untouched, without slot gating.
+    # the caller is actually allowed to use, untouched and without slot gating.
+    # First *permitted*, not first configured: picking PROVIDERS[0] blindly meant
+    # an unauthenticated caller got "Authentication required" whenever the config
+    # happened to list a paid backend first — another 401 about a backend they
+    # never chose.
     if not raw_model:
         if not conf.PROVIDERS:
             return Response(content="No providers configured", status_code=503)
-        provider = conf.PROVIDERS[0]
-        if not authorized and provider.require_permission:
+        provider = next(
+            (p for p in conf.PROVIDERS if authorized or not p.require_permission), None
+        )
+        if provider is None:
             return _unauthorized("")
         # No slot is taken on this path, so it is never queued — running from the
         # moment it is forwarded.
@@ -827,7 +862,12 @@ async def _route(
 
     targets = await router.resolve(raw_model)
     if not targets:
-        return Response(content="No providers configured", status_code=503)
+        if not conf.PROVIDERS:
+            return Response(content="No providers configured", status_code=503)
+        # Nothing serves this model. Say so — never fall back to an arbitrary
+        # backend, which is how a local-model request used to surface as a 401
+        # from a paid one.
+        return _model_not_found(raw_model, request)
 
     # Gate: unauthenticated callers can only reach open backends. If the model
     # lives solely behind permission-required backends, reject with 401.
