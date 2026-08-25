@@ -262,6 +262,44 @@ async def set_enabled_models(provider_name: str, models) -> tuple:
     return await _edit(mutate, check)
 
 
+async def set_model_map(provider_name: str, mapping: dict) -> tuple:
+    """Set a provider's `model_map`: native id -> the name clients use.
+
+    Keyed by the **native** id, because that is the direction the wire needs and
+    the direction `Provider.__post_init__` inverts. Native ids containing a colon
+    (`qwen3.8-max:thinking`) are written quoted: plain YAML accepts them since the
+    colon isn't followed by a space, but quoting is what the rest of this file does
+    with native ids and it cannot be broken by a later edit that adds a space.
+    """
+    wanted = {str(k): str(v) for k, v in (mapping or {}).items()}
+
+    def mutate(doc):
+        entry = _find_provider(doc, provider_name)
+        if entry is None:
+            return f"unknown provider '{provider_name}'"
+        if not wanted:
+            if "model_map" in entry:
+                del entry["model_map"]
+            return None
+        target = CommentedMap()
+        for native, canonical in wanted.items():
+            key = DoubleQuotedScalarString(native) if ":" in native else native
+            target[key] = canonical
+        entry["model_map"] = target
+        return None
+
+    def check(parsed):
+        for entry in parsed.get("providers") or []:
+            if entry.get("name") == provider_name:
+                got = {str(k): str(v) for k, v in (entry.get("model_map") or {}).items()}
+                if got != wanted:
+                    return "self-check failed: model_map in the rewritten file doesn't match"
+                return None
+        return f"self-check failed: provider '{provider_name}' vanished"
+
+    return await _edit(mutate, check)
+
+
 async def set_aliases(aliases: dict) -> tuple:
     """Replace the whole `aliases:` map. The console owns it as a unit — it is a
     flat name→target dictionary, so per-key surgery would buy nothing."""

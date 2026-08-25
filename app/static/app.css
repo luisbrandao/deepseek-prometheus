@@ -514,14 +514,17 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   font-size: 10px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted);
 }
 .cfgmaphead .muted { text-transform: none; letter-spacing: 0; margin-left: auto; }
+/* One editable mapping per line: two full-width fields beat a cramped grid when
+   native ids run to vendor/model-name:variant. */
 .cfgmapgrid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
-  gap: 3px 18px; max-height: 220px; overflow-y: auto; align-items: start;
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 260px; overflow-y: auto;
 }
-/* Native ids here run long (vendor/model-name:variant). Wrap the mapped name
-   under it rather than ellipsising the id. */
-.cfgmaprow { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
-.cfgmaprow .cfgcanon { flex: 0 1 auto; }
+.cfgmaprow { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cfgmapfoot { display: flex; align-items: center; gap: 8px; }
+.cfgmapfoot .grow { flex: 1; }
+.btn.tiny.primary { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+.btn.tiny.primary:hover { background: var(--accent); }
 .cfgmapbox .hint { font-size: 12px; }
 
 /* The native -> canonical -> wire walkthrough inside the help panel. */

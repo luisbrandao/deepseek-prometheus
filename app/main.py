@@ -576,6 +576,51 @@ async def admin_set_enabled_models(name: str, request: Request):
     return await _persisted(ok, error, f"{name}.enabled_models = {len(cleaned)} model(s)")
 
 
+@app.put("/admin/config/providers/{name}/model-map")
+async def admin_set_model_map(name: str, request: Request):
+    """Rename a backend's native ids for clients: `{"model_map": {native: canonical}}`.
+
+    The mapping must be a **bijection** — two native ids cannot share one canonical
+    name on the same provider. `Provider.__post_init__` builds the reverse lookup by
+    inverting this dict, so a collision silently makes one of them unreachable by
+    canonical name (verified: the last one wins). That is refused here rather than
+    written, with the advice that the multi-backend case wants a group instead.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    if name not in conf.PROVIDERS_BY_NAME:
+        return JSONResponse({"error": f"unknown provider '{name}'"}, status_code=404)
+    body = await request.json()
+    mapping = body.get("model_map")
+    if mapping is None:
+        mapping = {}
+    if not isinstance(mapping, dict):
+        return _bad('body must be {"model_map": {"native-id": "canonical-name", ...}}')
+    cleaned = {}
+    for native, canonical in mapping.items():
+        native, canonical = str(native).strip(), str(canonical).strip()
+        if not native or not canonical:
+            return _bad("every mapping needs both a native id and a name")
+        if any(c.isspace() for c in native) or any(c.isspace() for c in canonical):
+            return _bad(
+                f"'{native or canonical}' contains a space — a model id is a single "
+                f"token; enter the native id and the name in separate fields"
+            )
+        if native in cleaned:
+            return _bad(f"native id '{native}' is listed twice")
+        cleaned[native] = canonical
+    dupes = {c for c in cleaned.values() if list(cleaned.values()).count(c) > 1}
+    if dupes:
+        return _bad(
+            f"two native ids both map to {sorted(dupes)} — model_map must be one-to-one, "
+            f"or the reverse lookup silently picks one. To serve one name from several "
+            f"backends, make a group instead."
+        )
+    ok, error = await configwrite.set_model_map(name, cleaned)
+    return await _persisted(ok, error, f"{name}.model_map = {len(cleaned)} mapping(s)")
+
+
 @app.put("/admin/config/aliases")
 async def admin_set_aliases(request: Request):
     """Replace the alias map. An alias shadows everything else in resolution, so

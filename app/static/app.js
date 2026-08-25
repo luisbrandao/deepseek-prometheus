@@ -1062,6 +1062,14 @@ function catalogPicker(p, chosen, redraw) {
   const doAdd = () => {
     const v = input.value.trim();
     if (!v) return;
+    // This field pins ONE native id. People reach for it to write a mapping
+    // ("z-ai/glm-5.2 -> glm-5.2"), which used to be accepted verbatim as an id
+    // that could never match anything. Say where mappings live instead.
+    if (/->|=>|\s/.test(v)) {
+      toast("One native id only — no spaces or arrows. To rename an id for clients, "
+            + "use Name mapping below.", "bad");
+      return;
+    }
     chosen.add(v); input.value = ""; redraw();
   };
   btn.onclick = doAdd;
@@ -1119,35 +1127,71 @@ function exposureSummary(p, chosen) {
   return box;
 }
 
-// model_map, read-only. It is referenced by every explanation on this page, so
-// not showing it anywhere was the gap.
+// model_map, editable. This is how a native id gets a clean client-facing name
+// without a group — the question the "add a native model id" field kept being
+// mistaken for.
 function nameMapBlock(p) {
-  const entries = Object.entries(p.model_map || {});
+  let rows = Object.entries(p.model_map || {}).map(([native, canon]) => ({ native, canon }));
   const box = el("div", "cfgmapbox");
   const head = el("div", "cfgmaphead");
+  const countTag = el("span", "fltag");
   head.append(
     el("span", null, "Name mapping"),
-    el("span", "fltag", entries.length ? entries.length + " entries" : "none"),
+    countTag,
     el("span", "muted", "native id → what clients call it"),
   );
   box.appendChild(head);
-  if (!entries.length) {
-    box.appendChild(el("div", "hint",
-      "No model_map for this backend, so every id it serves is exposed under its "
-      + "native name. Add a group to give one a clean name, or a model_map entry in "
-      + "the config file to rename it outright."));
-    return box;
-  }
   const grid = el("div", "cfgmapgrid");
-  for (const [native, canon] of entries.sort((a, b) => a[1].localeCompare(b[1]))) {
-    const row = el("div", "cfgmaprow");
-    row.append(el("span", "cfgcheckid", native), el("span", "cfgarrow", "→"),
-               el("span", "cfgcanon", canon));
-    grid.appendChild(row);
+  const foot = el("div", "cfgmapfoot");
+  box.append(grid, foot);
+
+  function draw() {
+    countTag.textContent = rows.length ? rows.length + " entries" : "none";
+    grid.innerHTML = "";
+    rows.forEach((r, i) => {
+      const row = el("div", "cfgmaprow");
+      const native = el("input");
+      native.type = "text"; native.className = "cfginput mono"; native.value = r.native;
+      native.placeholder = "native id, e.g. z-ai/glm-5.2";
+      native.onchange = () => { r.native = native.value.trim(); };
+      const canon = el("input");
+      canon.type = "text"; canon.className = "cfginput mono"; canon.value = r.canon;
+      canon.placeholder = "name clients send, e.g. glm-5.2";
+      canon.onchange = () => { r.canon = canon.value.trim(); };
+      const del = el("button", "mini", "✕");
+      del.title = "remove this mapping";
+      del.onclick = () => { rows.splice(i, 1); draw(); };
+      row.append(native, el("span", "cfgarrow", "→"), canon, del);
+      grid.appendChild(row);
+    });
+    if (!rows.length) {
+      grid.appendChild(el("div", "hint",
+        "No mapping — every id this backend serves is exposed under its native name. "
+        + "Add one to rename it for clients."));
+    }
+    foot.innerHTML = "";
+    const add = el("button", "btn tiny", "+ Add mapping");
+    add.onclick = () => { rows.push({ native: "", canon: "" }); draw(); };
+    const reset = el("button", "btn tiny", "Reset");
+    reset.onclick = () => {
+      rows = Object.entries(p.model_map || {}).map(([native, canon]) => ({ native, canon }));
+      draw();
+    };
+    const save = el("button", "btn tiny primary", "Save mapping");
+    save.disabled = cfgDisabled();
+    save.onclick = () => {
+      const out = {};
+      for (const r of rows) {
+        if (!r.native || !r.canon) { toast("Every mapping needs both fields", "bad"); return; }
+        if (out[r.native]) { toast("'" + r.native + "' is listed twice", "bad"); return; }
+        out[r.native] = r.canon;
+      }
+      cfgSave(`/admin/config/providers/${encodeURIComponent(p.name)}/model-map`,
+              "PUT", { model_map: out }, p.name + " mapping");
+    };
+    foot.append(add, el("span", "grow"), reset, save);
   }
-  box.appendChild(grid);
-  box.appendChild(el("div", "hint",
-    "Read-only here — model_map is edited in the config file for now."));
+  draw();
   return box;
 }
 

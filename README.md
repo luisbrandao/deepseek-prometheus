@@ -264,6 +264,20 @@ routing:
 
 ### Canonical names
 
+`model_map` is keyed by the **native** id, and must be a bijection per provider —
+`Provider.__post_init__` inverts it to build the reverse lookup, so two natives sharing a
+canonical name make one of them unreachable by that name. Native ids containing a colon
+(`qwen3.8-max:thinking`) parse fine unquoted, since YAML only splits on colon-*space*, but
+the console quotes them on write:
+
+```yaml
+providers:
+  - name: nanoGPT
+    model_map:
+      z-ai/glm-5.2: glm-5.2
+      "qwen3.8-max:thinking": qwen-max
+```
+
 > Short version, since this is the part everyone forgets: a **canonical name** is what
 > clients send (`glm-5.2`) and a **native id** is what one backend calls that same model
 > on the wire (`zai-org/glm-5.2` on nanoGPT, `z-ai/glm-5.2` on openRouter). `model_map`
@@ -360,6 +374,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
 | `/admin/config` | `GET` | The editable config: providers (no secrets), logical models, aliases, routing |
 | `/admin/config/providers/{name}/enabled-models` | `PUT` | Set a backend's upstream allow-list (`[]` = allow all, live discovery) |
+| `/admin/config/providers/{name}/model-map` | `PUT` | Set a backend's `model_map` (native id → canonical name); refuses a non-bijection |
 | `/admin/config/aliases` | `PUT` | Replace the alias map |
 | `/admin/config/models/{name}` | `PUT` / `DELETE` | Create, replace or drop a logical model (group) |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
@@ -428,8 +443,15 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     ("1 behind a group · 1 renamed by model_map · 4 exposed under the raw id") and names
     the raw ones, since pinning a model does **not** give it a clean name and that is the
     single most common misreading of this page.
-  - **Name mapping** per backend shows its `model_map` (native id → what clients call it),
-    read-only; it is edited in the config file.
+  - **Name mapping** per backend edits its `model_map` — `native id → what clients call
+    it` — which is how a native id gets a clean public name without a group. The mapping
+    must be one-to-one: two native ids sharing a canonical name would make the reverse
+    lookup pick one silently, so that is refused with a pointer to groups (which is what
+    the multi-backend case actually wants).
+  - The **add a native model id** field pins exactly one id into the allow-list — it is
+    not where renaming happens. Anything with a space or an arrow (`a -> b`) is rejected
+    and points at Name mapping, because that mistake used to be accepted verbatim as an
+    id that could never match anything.
   - Each section has a **(?)** panel explaining the concepts in place — including a
     walkthrough of the same model's name at each hop (backend reports `zai-org/glm-5.2`
     → `model_map` renames it → client asks for `glm-5.2` → proxy sends
