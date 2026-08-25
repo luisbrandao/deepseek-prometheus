@@ -460,17 +460,79 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 .cfgsearch:focus { outline: none; border-color: var(--accent-2); }
 .cfgsearch::placeholder { color: var(--muted); font-family: var(--sans); }
 .cfgcheckgrid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 4px 14px; max-height: 260px; overflow-y: auto;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 4px 14px; max-height: 300px; overflow-y: auto;
   border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--bg);
+  align-items: start;
 }
-.cfgcheck { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 2px 0; min-width: 0; }
+/* Wraps rather than truncates: the native id is the primary information, so when
+   it and its "→ canonical" tag don't fit on one line the tag drops below it. */
+.cfgcheck {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 2px 0;
+  min-width: 0; flex-wrap: wrap; row-gap: 1px;
+}
 .cfgcheck input { accent-color: var(--accent); width: 14px; height: 14px; flex: 0 0 auto; }
 .cfgcheckid {
   font-family: var(--mono); font-size: 11.5px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
 }
 .cfgadd { display: flex; gap: 8px; }
+
+/* "→ glm-5.2  group" next to a native id: what clients actually send. */
+/* Always its own indented line under the id. Sharing the line would let flexbox
+   shrink the id (it is ellipsised, so it yields first) and the native id is the
+   thing you came to read. */
+.cfgmapped {
+  display: flex; align-items: center; gap: 5px;
+  flex: 0 0 100%; margin-left: 22px; min-width: 0;
+}
+.cfgarrow { color: var(--muted); font-size: 11px; }
+.cfgcanon {
+  font-family: var(--mono); font-size: 11.5px; color: var(--accent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cfgvia {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
+  border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px;
+}
+
+/* Plain-language summary of how the pinned ids are exposed. */
+.cfgexpose {
+  background: var(--bg); border: 1px solid var(--line); border-left: 3px solid var(--accent-2);
+  border-radius: 8px; padding: 9px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.cfgexposehead { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.cfgexposeraw { font-size: 12px; color: var(--muted); line-height: 1.7; }
+
+/* model_map, read-only */
+.cfgmapbox {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg);
+  padding: 9px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.cfgmaphead {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted);
+}
+.cfgmaphead .muted { text-transform: none; letter-spacing: 0; margin-left: auto; }
+.cfgmapgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+  gap: 3px 18px; max-height: 220px; overflow-y: auto; align-items: start;
+}
+/* Native ids here run long (vendor/model-name:variant). Wrap the mapped name
+   under it rather than ellipsising the id. */
+.cfgmaprow { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+.cfgmaprow .cfgcanon { flex: 0 1 auto; }
+.cfgmapbox .hint { font-size: 12px; }
+
+/* The native -> canonical -> wire walkthrough inside the help panel. */
+.cfgflow {
+  display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap;
+  margin: 4px 0 10px; padding: 10px 12px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+}
+.cfgflowstep { display: flex; flex-direction: column; gap: 3px; }
+.cfgflowlabel { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.cfgflowarrow { color: var(--accent); font-size: 14px; padding-bottom: 2px; }
 
 /* One target / alias row: fields sized so several cards line up down the page. */
 .cfgtrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

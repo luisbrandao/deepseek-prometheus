@@ -421,9 +421,20 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   - **Aliases** — add, edit and delete short names. An alias pointing at an unknown
     provider is refused rather than written, since an alias resolves ahead of everything
     else and a broken one silently breaks a model name.
-  - Each section has a **(?)** panel explaining the concepts in place — in particular
-    canonical vs. native names, which is the thing worth having on screen while you are
-    staring at a list of native ids.
+  - Every pinned id is tagged with **what a client actually has to send** for it:
+    `→ glm-5.3 group` when a group fronts it, `→ deepseek-v4-flash model_map` when the
+    provider renames it, and nothing when neither applies — because then the raw native
+    id *is* the public name. A summary line above the list counts all three
+    ("1 behind a group · 1 renamed by model_map · 4 exposed under the raw id") and names
+    the raw ones, since pinning a model does **not** give it a clean name and that is the
+    single most common misreading of this page.
+  - **Name mapping** per backend shows its `model_map` (native id → what clients call it),
+    read-only; it is edited in the config file.
+  - Each section has a **(?)** panel explaining the concepts in place — including a
+    walkthrough of the same model's name at each hop (backend reports `zai-org/glm-5.2`
+    → `model_map` renames it → client asks for `glm-5.2` → proxy sends
+    `zai-org/glm-5.2`), which is the thing worth having on screen while you are staring
+    at a list of native ids.
   - `api_key` values are never sent to the browser; a provider shows only whether one is
     set. Editing secrets and adding/removing whole providers stay file-side for now.
 

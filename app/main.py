@@ -461,10 +461,29 @@ def _config_targets(model_name: str, lm) -> list:
     ]
 
 
+def _fronted_natives() -> dict:
+    """`{provider: {native_id: group_name}}` — which backend ids a logical model
+    already fronts.
+
+    The editor needs it to answer the only question that matters about a pinned
+    id: *what does a client actually have to send for this?* A group fronting an
+    id means clients use the group's name and the raw id is hidden from
+    `/v1/models` (see `registry.list_models`), so showing the id alone is
+    misleading. Computed here rather than in the browser because
+    `_resolved_native` already knows how an inherited target resolves.
+    """
+    out = {}
+    for name, lm in conf.LOGICAL_MODELS.items():
+        for t in lm.targets:
+            out.setdefault(t.provider, {}).setdefault(_resolved_native(name, t), name)
+    return out
+
+
 def _config_snapshot() -> dict:
     """The config as the console edits it. **Never** includes `api_key`: a
     provider reports only whether one is set (`has_api_key`), preserving the rule
     that secrets do not leave the process."""
+    fronted = _fronted_natives()
     return {
         "path": conf.CONFIG_PATH,
         "writable": configwrite.config_writable(),
@@ -480,6 +499,7 @@ def _config_snapshot() -> dict:
                 "lists_all": p.lists_all,
                 "enabled_models": list(p.enabled_models),
                 "model_map": dict(p.model_map),
+                "fronted": fronted.get(p.name, {}),
                 "has_api_key": bool(p.api_key),
             }
             for p in conf.PROVIDERS

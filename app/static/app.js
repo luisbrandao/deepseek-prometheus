@@ -745,20 +745,50 @@ function cfgHead(title, key, build) {
 }
 
 function helpNative() {
+  const flow = el("div", "cfgflow");
+  flow.append(
+    el("div", "cfgflowrow"), // filled below
+  );
+  flow.innerHTML = "";
+  const step = (label, value) => {
+    const d = el("div", "cfgflowstep");
+    d.append(el("span", "cfgflowlabel", label), el("code", null, value));
+    return d;
+  };
+  flow.append(
+    step("backend reports", "zai-org/glm-5.2"),
+    el("span", "cfgflowarrow", "→"),
+    step("model_map renames it", "glm-5.2"),
+    el("span", "cfgflowarrow", "→"),
+    step("client asks for", "glm-5.2"),
+    el("span", "cfgflowarrow", "→"),
+    step("proxy sends", "zai-org/glm-5.2"),
+  );
   return [
-    helpLine("Two names for every model, and this page uses both."),
+    helpLine("Every model has two names, and this page shows both."),
     helpLine(
-      "A ", el("b", null, "canonical name"), " is what clients send you — ",
-      code("glm-5.2"), ". Clean, and the same whichever backend ends up serving it.",
+      "A ", el("b", null, "native id"), " is what one backend calls the model on the wire — ",
+      code("zai-org/glm-5.2"), " on nanoGPT, ", code("z-ai/glm-5.2"), " on openRouter. ",
+      "The checkboxes below are native ids, read straight from the backend's ",
+      code("/v1/models"), ", which is why they carry vendor prefixes and look messy.",
     ),
     helpLine(
-      "A ", el("b", null, "native id"), " is what one specific backend calls that model on the wire. ",
-      "The same model is ", code("zai-org/glm-5.2"), " on nanoGPT and ", code("z-ai/glm-5.2"),
-      " on openRouter. Each provider's ", code("model_map"), " in the config translates between the two.",
+      "A ", el("b", null, "canonical name"), " is what your clients send — ", code("glm-5.2"),
+      " — and stays the same whichever backend serves it.",
+    ),
+    flow,
+    helpLine(
+      el("b", null, "The part that trips everyone up:"), " if a native id has ",
+      el("b", null, "no"), " ", code("model_map"), " entry and no group in front of it, there is ",
+      "no translation — the raw id ", el("i", null, "is"), " the public name, and a client has to send ",
+      code("moonshotai/kimi-k3"), " verbatim. Pinning a model does not give it a clean name.",
     ),
     helpLine(
-      "The checkboxes above are ", el("b", null, "native ids"), " — a backend's own vocabulary, ",
-      "read straight from its ", code("/v1/models"), ". That is why they look messy.",
+      "Two ways to give one a clean name: a ", el("b", null, "group"), " (below, editable here) ",
+      "that fronts it — which also hides the raw id from ", code("/v1/models"), " — or a ",
+      code("model_map"), " entry in the config file, which renames it outright. Each pinned id ",
+      "above is tagged with the name clients actually use, and the summary line says how many ",
+      "are still exposed raw.",
     ),
   ];
 }
@@ -886,8 +916,10 @@ function cfgProviderCard(p) {
         "Everything this backend reports from /v1/models is available. " +
         "Its catalog is refreshed every " + p.cache_ttl + "s."));
     } else {
+      list.appendChild(exposureSummary(p, chosen));
       list.appendChild(catalogPicker(p, chosen, draw));
     }
+    list.appendChild(nameMapBlock(p));
     actions.innerHTML = "";
     const save = el("button", "btn primary", "Save");
     save.disabled = cfgDisabled();
@@ -902,6 +934,31 @@ function cfgProviderCard(p) {
   body.append(modes, list, actions);
   card.appendChild(body);
   return card;
+}
+
+// What a client has to send to reach this native id. Three cases, and the
+// difference between them is the thing the page was failing to explain:
+//   fronted by a group  -> clients use the group name; the raw id is hidden
+//   in model_map        -> clients use the mapped canonical name
+//   neither             -> the native id IS the public name, verbatim
+function clientName(p, native) {
+  const group = (p.fronted || {})[native];
+  if (group) return { name: group, via: "group" };
+  const canon = (p.model_map || {})[native];
+  if (canon && canon !== native) return { name: canon, via: "model_map" };
+  return null;
+}
+
+function clientNameTag(p, native) {
+  const cn = clientName(p, native);
+  if (!cn) return null;
+  const tag = el("span", "cfgmapped");
+  tag.append(el("span", "cfgarrow", "→"), el("span", "cfgcanon", cn.name),
+             el("span", "cfgvia", cn.via));
+  tag.title = cn.via === "group"
+    ? `clients send "${cn.name}" — the group ${cn.name} fronts this id, and it is hidden from /v1/models`
+    : `clients send "${cn.name}" — this provider's model_map renames it`;
+  return tag;
 }
 
 function catalogPicker(p, chosen, redraw) {
@@ -946,6 +1003,8 @@ function catalogPicker(p, chosen, redraw) {
     const cb = el("input"); cb.type = "checkbox"; cb.checked = chosen.has(id);
     cb.onchange = () => { cb.checked ? chosen.add(id) : chosen.delete(id); refresh(); };
     row.append(cb, el("span", "cfgcheckid", id));
+    const tag = clientNameTag(p, id);
+    if (tag) row.appendChild(tag);
     if (!reported.has(id) && st && st.ids) {
       const warn = el("span", "fltag warn", "not in catalog");
       warn.title = "pinned here but the backend no longer reports it";
@@ -992,8 +1051,13 @@ function catalogPicker(p, chosen, redraw) {
 
   // Manual entry, for a backend that can't be probed (or an id it hides).
   const add = el("div", "cfgadd");
-  const input = el("input"); input.type = "text"; input.placeholder = "add a native model id…";
-  input.className = "cfginput";
+  const input = el("input"); input.type = "text"; input.className = "cfginput";
+  // A concrete example beats the abstract label: pick one of this backend's own
+  // ids so the shape (vendor prefixes, colons, suffixes) is obvious.
+  const sample = Object.keys(p.model_map || {})[0] || (st && st.ids && st.ids[0]) || all[0];
+  input.placeholder = sample
+    ? `add a native model id…    e.g. ${sample}`
+    : "add a native model id…    e.g. vendor/model-name:variant";
   const btn = el("button", "btn tiny", "Add");
   const doAdd = () => {
     const v = input.value.trim();
@@ -1021,6 +1085,70 @@ async function probeProvider(name, redraw) {
     cfgCatalog.set(name, { error: "probe failed — cannot reach the proxy" });
   }
   redraw();
+}
+
+// One line telling you, in plain terms, how the ids you pinned are exposed —
+// because "8 pinned" says nothing about what a client is supposed to type.
+function exposureSummary(p, chosen) {
+  const ids = Array.from(chosen);
+  let viaGroup = 0, viaMap = 0, raw = [];
+  for (const id of ids) {
+    const cn = clientName(p, id);
+    if (!cn) raw.push(id);
+    else if (cn.via === "group") viaGroup += 1;
+    else viaMap += 1;
+  }
+  const box = el("div", "cfgexpose");
+  const parts = [];
+  if (viaGroup) parts.push(viaGroup + " behind a group");
+  if (viaMap) parts.push(viaMap + " renamed by model_map");
+  if (raw.length) parts.push(raw.length + " exposed under the raw id");
+  box.appendChild(el("div", "cfgexposehead",
+    ids.length ? "Clients see: " + parts.join(" · ") : "Nothing pinned yet."));
+  if (raw.length) {
+    const d = el("div", "cfgexposeraw");
+    d.append(document.createTextNode(
+      "These have no group and no model_map entry, so a client must send the id exactly as written: "));
+    raw.slice(0, 8).forEach((id, i) => {
+      if (i) d.append(document.createTextNode(", "));
+      d.appendChild(code(id));
+    });
+    if (raw.length > 8) d.append(document.createTextNode(` and ${raw.length - 8} more`));
+    box.appendChild(d);
+  }
+  return box;
+}
+
+// model_map, read-only. It is referenced by every explanation on this page, so
+// not showing it anywhere was the gap.
+function nameMapBlock(p) {
+  const entries = Object.entries(p.model_map || {});
+  const box = el("div", "cfgmapbox");
+  const head = el("div", "cfgmaphead");
+  head.append(
+    el("span", null, "Name mapping"),
+    el("span", "fltag", entries.length ? entries.length + " entries" : "none"),
+    el("span", "muted", "native id → what clients call it"),
+  );
+  box.appendChild(head);
+  if (!entries.length) {
+    box.appendChild(el("div", "hint",
+      "No model_map for this backend, so every id it serves is exposed under its "
+      + "native name. Add a group to give one a clean name, or a model_map entry in "
+      + "the config file to rename it outright."));
+    return box;
+  }
+  const grid = el("div", "cfgmapgrid");
+  for (const [native, canon] of entries.sort((a, b) => a[1].localeCompare(b[1]))) {
+    const row = el("div", "cfgmaprow");
+    row.append(el("span", "cfgcheckid", native), el("span", "cfgarrow", "→"),
+               el("span", "cfgcanon", canon));
+    grid.appendChild(row);
+  }
+  box.appendChild(grid);
+  box.appendChild(el("div", "hint",
+    "Read-only here — model_map is edited in the config file for now."));
+  return box;
 }
 
 /* ── Model groups (logical models) ────────────────────────── */
