@@ -430,8 +430,35 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 
 .btn.tiny { padding: 4px 9px; font-size: 12px; }
 
+/* Section heading + its (?) panel */
+.cfgheadwrap { margin-bottom: 10px; }
+.cfgheadwrap h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 0; }
+.cfghelpbtn {
+  width: 17px; height: 17px; flex: 0 0 auto; padding: 0; line-height: 1;
+  border-radius: 50%; cursor: pointer; font-size: 11px; font-weight: 700;
+  background: var(--bg-3); border: 1px solid var(--line-2); color: var(--muted);
+}
+.cfghelpbtn:hover { color: var(--text); border-color: var(--accent-2); }
+.cfghelpbtn.on { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+.cfghelp {
+  margin: 10px 0 4px; padding: 12px 14px; max-width: 92ch;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-2); border-radius: 8px;
+}
+.cfghelpline { margin: 0 0 8px; font-size: 13px; line-height: 1.6; color: var(--text); }
+.cfghelpline:last-child { margin-bottom: 0; }
+.cfghelpline b { color: #fff; font-weight: 600; }
+
 .cfgpick { display: flex; flex-direction: column; gap: 8px; }
-.cfgpickhead { display: flex; align-items: center; gap: 10px; }
+.cfgpickhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cfgpickhead .muted { flex: 0 0 auto; min-width: 130px; }
+.cfgsearch {
+  flex: 1 1 200px; min-width: 150px;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: 7px; padding: 5px 10px; font-size: 12.5px; font-family: var(--mono);
+}
+.cfgsearch:focus { outline: none; border-color: var(--accent-2); }
+.cfgsearch::placeholder { color: var(--muted); font-family: var(--sans); }
 .cfgcheckgrid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 4px 14px; max-height: 260px; overflow-y: auto;

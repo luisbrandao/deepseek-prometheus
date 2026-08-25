@@ -708,7 +708,61 @@ function timeCell(label, value) {
  * are explicit rather than as-you-type. */
 let cfg = null;                       // last snapshot from the server
 const cfgCatalog = new Map();         // provider -> {loading, ids, error}
+const cfgFilter = new Map();          // provider -> search text, survives re-renders
+const cfgOpenHelp = new Set();        // section keys whose (?) panel is open
 let cfgNewModelName = "";
+
+/* Inline help. Kept on the page rather than in the README because the two
+ * vocabularies (canonical vs native) are the thing everyone forgets, and the
+ * moment you need reminding is while looking at a list of native ids. */
+function code(text) { return el("code", null, text); }
+
+function helpLine(...parts) {
+  const line = el("p", "cfghelpline");
+  for (const part of parts) line.append(typeof part === "string" ? document.createTextNode(part) : part);
+  return line;
+}
+
+// A section heading with a (?) toggle. `build()` is only called when opened.
+function cfgHead(title, key, build) {
+  const wrap = el("div", "cfgheadwrap");
+  const h = el("h2", null, title);
+  const btn = el("button", "cfghelpbtn", "?");
+  btn.title = "what is this?";
+  btn.onclick = () => {
+    cfgOpenHelp.has(key) ? cfgOpenHelp.delete(key) : cfgOpenHelp.add(key);
+    renderConfig();
+  };
+  if (cfgOpenHelp.has(key)) btn.classList.add("on");
+  h.appendChild(btn);
+  wrap.appendChild(h);
+  if (cfgOpenHelp.has(key)) {
+    const panel = el("div", "cfghelp");
+    for (const node of build()) panel.appendChild(node);
+    wrap.appendChild(panel);
+  }
+  return wrap;
+}
+
+function helpNative() {
+  return [
+    helpLine("Two names for every model, and this page uses both."),
+    helpLine(
+      "A ", el("b", null, "canonical name"), " is what clients send you — ",
+      code("glm-5.2"), ". Clean, and the same whichever backend ends up serving it.",
+    ),
+    helpLine(
+      "A ", el("b", null, "native id"), " is what one specific backend calls that model on the wire. ",
+      "The same model is ", code("zai-org/glm-5.2"), " on nanoGPT and ", code("z-ai/glm-5.2"),
+      " on openRouter. Each provider's ", code("model_map"), " in the config translates between the two.",
+    ),
+    helpLine(
+      "The checkboxes above are ", el("b", null, "native ids"), " — a backend's own vocabulary, ",
+      "read straight from its ", code("/v1/models"), ". That is why they look messy.",
+    ),
+  ];
+}
+
 
 async function loadConfig() {
   let res;
@@ -743,7 +797,8 @@ async function cfgSave(path, method, body, what) {
   }
   cfg = data;
   renderConfig();
-  toast(what + " saved to " + (cfg.path || "config"));
+  // Basename only: the full container path is long enough to wrap the toast.
+  toast(what + " saved to " + (cfg.path || "config").split("/").pop());
   return true;
 }
 
@@ -769,11 +824,25 @@ const cfgDisabled = () => !cfg.writable;
 /* ── Upstream models per provider ─────────────────────────── */
 function cfgUpstreamSection() {
   const wrap = el("div", "cfgsec");
-  wrap.appendChild(el("h2", null, "Upstream models"));
+  wrap.appendChild(cfgHead("Upstream models", "upstream", () => [
+    ...helpNative(),
+    helpLine(
+      el("b", null, "Allow all"), " means the proxy serves whatever the backend reports, ",
+      "re-checked on a timer. Good for a box whose model list you change often.",
+    ),
+    helpLine(
+      el("b", null, "Only these"), " pins an explicit allow-list. Anything not ticked is ",
+      "invisible to clients and unroutable, even if the backend still serves it. ",
+      "Good for a paid provider with hundreds of models where you only want a few.",
+    ),
+    helpLine(
+      code("not in catalog"), " on a ticked id means it is pinned here but the backend no ",
+      "longer reports it — usually a model that was retired upstream. It stays ticked so ",
+      "saving cannot silently drop it; untick it to let it go.",
+    ),
+  ]));
   wrap.appendChild(el("div", "hint",
-    "Which native model ids each backend is allowed to serve. " +
-    "Allow all means the proxy uses whatever the backend live-reports — add an " +
-    "explicit list to pin it down."));
+    "Which native model ids each backend is allowed to serve."));
   for (const p of cfg.providers) wrap.appendChild(cfgProviderCard(p));
   return wrap;
 }
@@ -838,38 +907,88 @@ function cfgProviderCard(p) {
 function catalogPicker(p, chosen, redraw) {
   const box = el("div", "cfgpick");
   const st = cfgCatalog.get(p.name);
+
+  // Union of the probed catalog and whatever is already pinned: an id the backend
+  // no longer reports must stay visible and checked, or saving would silently
+  // drop it.
+  const reported = new Set(st && st.ids ? st.ids : []);
+  const all = Array.from(new Set([...reported, ...chosen])).sort();
+
   const head = el("div", "cfgpickhead");
+  const count = el("span", "muted");
+  const search = el("input");
+  search.type = "search";
+  search.className = "cfgsearch";
+  search.placeholder = "filter " + (all.length || "") + " ids…";
+  search.value = cfgFilter.get(p.name) || "";
   const probe = el("button", "btn tiny", st && st.ids ? "Re-probe" : "Probe backend");
   probe.title = "ask this backend for its full model list";
   probe.onclick = () => probeProvider(p.name, redraw);
-  head.append(el("span", "muted", Array.from(chosen).length + " selected"), probe);
+  const pickShown = el("button", "btn tiny", "Tick shown");
+  const clearShown = el("button", "btn tiny", "Untick shown");
+  head.append(count, search, pickShown, clearShown, probe);
   box.appendChild(head);
 
   if (st && st.loading) { box.appendChild(el("div", "muted", "probing…")); return box; }
-  if (st && st.error) { box.appendChild(el("div", "uerr", st.error)); }
+  if (st && st.error) box.appendChild(el("div", "uerr", st.error));
 
-  // Union of the probed catalog and whatever is already pinned: an id the
-  // backend no longer reports must stay visible and checked, or saving would
-  // silently drop it.
-  const ids = new Set(st && st.ids ? st.ids : []);
-  const all = Array.from(new Set([...ids, ...chosen])).sort();
   if (!all.length) {
     box.appendChild(el("div", "hint", "Probe the backend to list what it serves, or type ids below."));
   }
+
+  // Rows are built once and shown/hidden by the filter. Ticking updates the count
+  // in place — a re-render on every keystroke or click would throw away the
+  // reader's scroll position in a 300-model list, and the focus in the search box.
   const grid = el("div", "cfgcheckgrid");
+  const rows = [];
   for (const id of all) {
     const row = el("label", "cfgcheck");
     const cb = el("input"); cb.type = "checkbox"; cb.checked = chosen.has(id);
-    cb.onchange = () => { cb.checked ? chosen.add(id) : chosen.delete(id); redraw(); };
+    cb.onchange = () => { cb.checked ? chosen.add(id) : chosen.delete(id); refresh(); };
     row.append(cb, el("span", "cfgcheckid", id));
-    if (!ids.has(id) && st && st.ids) {
+    if (!reported.has(id) && st && st.ids) {
       const warn = el("span", "fltag warn", "not in catalog");
       warn.title = "pinned here but the backend no longer reports it";
       row.appendChild(warn);
     }
     grid.appendChild(row);
+    rows.push({ id, row, cb });
   }
   box.appendChild(grid);
+  const empty = el("div", "hint", "Nothing matches that filter.");
+  empty.style.display = "none";
+  box.appendChild(empty);
+
+  const shown = () => rows.filter((r) => r.row.style.display !== "none");
+
+  function refresh() {
+    const q = search.value.trim().toLowerCase();
+    let visible = 0;
+    for (const r of rows) {
+      const match = !q || r.id.toLowerCase().includes(q);
+      r.row.style.display = match ? "" : "none";
+      if (match) visible += 1;
+    }
+    empty.style.display = all.length && !visible ? "" : "none";
+    count.textContent = chosen.size + " of " + all.length + " selected"
+      + (q ? "  ·  " + visible + " shown" : "");
+    const none = !visible;
+    pickShown.disabled = none;
+    clearShown.disabled = none;
+    pickShown.title = q ? "tick every id matching the filter" : "tick all";
+    clearShown.title = q ? "untick every id matching the filter" : "untick all";
+  }
+
+  search.addEventListener("input", () => { cfgFilter.set(p.name, search.value); refresh(); });
+  pickShown.onclick = () => {
+    for (const r of shown()) { chosen.add(r.id); r.cb.checked = true; }
+    refresh();
+  };
+  clearShown.onclick = () => {
+    for (const r of shown()) { chosen.delete(r.id); r.cb.checked = false; }
+    refresh();
+  };
+  refresh();
 
   // Manual entry, for a backend that can't be probed (or an id it hides).
   const add = el("div", "cfgadd");
@@ -907,11 +1026,28 @@ async function probeProvider(name, redraw) {
 /* ── Model groups (logical models) ────────────────────────── */
 function cfgGroupsSection() {
   const wrap = el("div", "cfgsec");
-  wrap.appendChild(el("h2", null, "Model groups"));
-  wrap.appendChild(el("div", "hint",
-    "One client-facing name in front of an ordered list of backends. Lower priority " +
-    "wins; equal priorities share load. Leave the native id blank to inherit it from " +
-    "the backend's model_map."));
+  wrap.appendChild(cfgHead("Model groups", "groups", () => [
+    helpLine(
+      "A group is one ", el("b", null, "canonical name"), " your clients ask for, in front of ",
+      "an ordered list of backends that can serve it. It gives you failover and ",
+      "load-balancing behind a single stable name.",
+    ),
+    helpLine(
+      el("b", null, "Priority"), " — lower wins. The proxy takes the lowest-priority backend ",
+      "with a free slot; equal priorities share load round-robin. If they are all busy the ",
+      "request queues, and if one errors the next one is tried.",
+    ),
+    helpLine(
+      el("b", null, "Native id"), " — what to send that backend on the wire. Leave it ",
+      el("b", null, "blank"), " to inherit it from that provider's ", code("model_map"),
+      "; the greyed ", code("inherits …"), " placeholder shows what that resolves to today. ",
+      "Fill it in only to override — e.g. pinning a specific quantization on one box.",
+    ),
+    helpLine(
+      "A group hides the ids it fronts from ", code("/v1/models"), ", so clients use the ",
+      "stable group name instead of a per-backend variant.",
+    ),
+  ]));
   for (const m of cfg.logical_models) wrap.appendChild(cfgGroupCard(m));
 
   const add = el("div", "cfgnew");
@@ -1022,10 +1158,22 @@ function cfgGroupCard(m) {
 /* ── Aliases ──────────────────────────────────────────────── */
 function cfgAliasSection() {
   const wrap = el("div", "cfgsec");
-  wrap.appendChild(el("h2", null, "Aliases"));
-  wrap.appendChild(el("div", "hint",
-    "A short name that resolves to something else — a bare model name, or " +
-    "provider:model to pin one backend. Aliases are resolved first, ahead of groups."));
+  wrap.appendChild(cfgHead("Aliases", "aliases", () => [
+    helpLine(
+      "A one-line shortcut: one name resolves to another. ", code("chat"), " → ",
+      code("deepseek-v4-pro"), " lets a client send ", code("chat"), " and get that model.",
+    ),
+    helpLine(
+      "Unlike a group, an alias has no failover or priorities — it is pure renaming. ",
+      "Point it at a canonical name, or at ", code("provider:model"),
+      " to force one specific backend.",
+    ),
+    helpLine(
+      el("b", null, "Aliases resolve first"), ", ahead of groups and everything else. So an ",
+      "alias sharing a name with a group wins and the group becomes unreachable — which is ",
+      "why that combination is refused here.",
+    ),
+  ]));
   let rows = Object.entries(cfg.aliases).map(([k, v]) => ({ k, v }));
   const list = el("div", "cfgcard");
   const actions = el("div", "cfgactions");

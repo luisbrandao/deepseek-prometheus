@@ -264,6 +264,12 @@ routing:
 
 ### Canonical names
 
+> Short version, since this is the part everyone forgets: a **canonical name** is what
+> clients send (`glm-5.2`) and a **native id** is what one backend calls that same model
+> on the wire (`zai-org/glm-5.2` on nanoGPT, `z-ai/glm-5.2` on openRouter). `model_map`
+> translates between them, per provider. The console's Config tab has the same
+> explanation behind a (?) next to each section.
+
 Clients only ever see and send **canonical** names; native (provider-specific) ids stay
 internal. Two layers mint canonical names:
 
@@ -406,12 +412,18 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   - **Upstream models** — per backend, either *allow all* (use whatever it live-reports)
     or an explicit list. **Probe backend** fetches its real catalog as checkboxes; an id
     that is pinned but no longer reported stays visible and checked, marked
-    *not in catalog*, so saving cannot silently drop it.
+    *not in catalog*, so saving cannot silently drop it. A paid provider can report
+    hundreds of ids, so the list has a **filter** plus **Tick shown** / **Untick shown**
+    for bulk selection of whatever the filter matches — typing and ticking never re-render
+    the list, so focus and scroll position survive.
   - **Model groups** — add, edit and delete logical models: pick each target's backend,
     native id (blank inherits from `model_map`) and priority.
   - **Aliases** — add, edit and delete short names. An alias pointing at an unknown
     provider is refused rather than written, since an alias resolves ahead of everything
     else and a broken one silently breaks a model name.
+  - Each section has a **(?)** panel explaining the concepts in place — in particular
+    canonical vs. native names, which is the thing worth having on screen while you are
+    staring at a list of native ids.
   - `api_key` values are never sent to the browser; a provider shows only whether one is
     set. Editing secrets and adding/removing whole providers stay file-side for now.
 
