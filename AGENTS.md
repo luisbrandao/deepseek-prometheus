@@ -130,6 +130,14 @@ decompresses the response. Single process, async, one uvicorn worker.
   alignment padding is the one thing ruamel cannot keep; that normalizes once.
   The write must be **in-place** (`r+` + truncate): `/app/config.yaml` is a
   single-file bind mount, so replace-by-rename detaches from the host inode.
+  **Mutate the loaded document in place; never rebuild a node.** ruamel remembers
+  each scalar's quote style and each collection's flow/block style, and replacing a
+  `CommentedMap`/`CommentedSeq` discards all of it — which made a save that changed
+  nothing rewrite `"a": "b"` as `a: b` and flatten block lists into flow. Every
+  editor here keeps surviving entries at their original position untouched and only
+  writes genuine additions, removals and value changes. There is a regression test
+  for exactly this: two consecutive identical saves must leave the file
+  byte-identical.
   Abort-don't-corrupt: every mutation is serialized, re-parsed with plain PyYAML,
   and self-checked to contain exactly the requested change before the file is
   opened — plus a hard guard that the provider list is unchanged, since adding or

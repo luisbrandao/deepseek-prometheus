@@ -245,8 +245,24 @@ async def set_enabled_models(provider_name: str, models) -> tuple:
         entry = _find_provider(doc, provider_name)
         if entry is None:
             return f"unknown provider '{provider_name}'"
+        existing = entry.get("enabled_models")
+        if isinstance(existing, CommentedSeq):
+            # Mutate in place so the list keeps the style it was written in — this
+            # config has both flow (`[a, b]`) and block (`- a`) allow-lists, and
+            # rebuilding the sequence rewrote one into the other on every save.
+            # Surviving items stay at their original index with their original
+            # quoting; only genuine additions and removals move.
+            keep = set(wanted)
+            for i in range(len(existing) - 1, -1, -1):
+                if str(existing[i]) not in keep:
+                    del existing[i]
+            present = {str(v) for v in existing}
+            for native in wanted:
+                if native not in present:
+                    existing.append(native)
+            return None
         seq = CommentedSeq(wanted)
-        seq.fa.set_flow_style()  # keep short allow-lists on one line, as written
+        seq.fa.set_flow_style()  # a new list: match how they are written here
         entry["enabled_models"] = seq
         return None
 
@@ -281,10 +297,22 @@ async def set_model_map(provider_name: str, mapping: dict) -> tuple:
             if "model_map" in entry:
                 del entry["model_map"]
             return None
-        target = CommentedMap()
+        existing = entry.get("model_map")
+        target = existing if isinstance(existing, CommentedMap) else CommentedMap()
+        # Mutate in place and leave untouched entries strictly alone: ruamel keeps
+        # each scalar's original quote style, so re-saving an unchanged mapping
+        # must not rewrite `"a": "b"` as `a: b`. Rebuilding the map lost that and
+        # made a no-op save produce a diff.
+        for key in [k for k in target if str(k) not in wanted]:
+            del target[key]
+        by_str = {str(k): k for k in target}
         for native, canonical in wanted.items():
-            key = DoubleQuotedScalarString(native) if ":" in native else native
-            target[key] = canonical
+            key = by_str.get(native)
+            if key is not None:
+                if str(target[key]) != canonical:
+                    target[key] = canonical
+                continue
+            target[DoubleQuotedScalarString(native) if ":" in native else native] = canonical
         entry["model_map"] = target
         return None
 
