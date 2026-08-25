@@ -418,6 +418,52 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 }
 .tprio input:focus { outline: none; border-color: var(--accent-2); }
 
+/* ── Config editor ─────────────────────────────────────────── */
+.panel#tab-config { overflow-y: auto; }
+.cfgsec { margin-bottom: 26px; }
+.cfgsec .hint { margin: -4px 0 12px; max-width: 78ch; }
+.cfgcard { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.cfgmodes { display: flex; gap: 8px; padding: 12px 14px 0; flex-wrap: wrap; }
+.cfglist { padding: 0 14px; }
+.cfgactions { display: flex; gap: 8px; justify-content: flex-end; padding: 0 14px 12px; }
+.cfgsec > .cfgactions { padding-right: 0; }
+
+.btn.tiny { padding: 4px 9px; font-size: 12px; }
+
+.cfgpick { display: flex; flex-direction: column; gap: 8px; }
+.cfgpickhead { display: flex; align-items: center; gap: 10px; }
+.cfgcheckgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 4px 14px; max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--bg);
+}
+.cfgcheck { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 2px 0; min-width: 0; }
+.cfgcheck input { accent-color: var(--accent); width: 14px; height: 14px; flex: 0 0 auto; }
+.cfgcheckid {
+  font-family: var(--mono); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cfgadd { display: flex; gap: 8px; }
+
+/* One target / alias row: fields sized so several cards line up down the page. */
+.cfgtrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cfginput {
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: 7px; padding: 6px 9px; font-size: 12.5px; flex: 1 1 200px; min-width: 140px;
+}
+.cfginput.mono { font-family: var(--mono); font-size: 12px; }
+.cfginput:focus, .cfgsel:focus, .cfgprio:focus { outline: none; border-color: var(--accent-2); }
+.cfgsel {
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: 7px; padding: 6px 9px; font-size: 12.5px; flex: 0 0 auto; min-width: 130px;
+}
+.cfgprio {
+  width: 64px; flex: 0 0 auto; text-align: center;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: 7px; padding: 6px 7px; font-family: var(--mono); font-size: 12px;
+}
+.cfgnew { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+
 /* ── Aliases ───────────────────────────────────────────────── */
 .arow { display: flex; align-items: center; gap: 10px; padding: 6px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg-2); margin-bottom: 6px; }
 .aname { font-family: var(--mono); font-weight: 600; font-size: 12.5px; }

@@ -25,7 +25,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix) + `PERSISTABLE_COUNTERS`. |
 | `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
-| `app/configwrite.py` | Persists runtime routing edits into `CONFIG_PATH` via a surgical, priority-digits-only text rewrite (comments/format preserved). Abort-don't-corrupt; in-place write (bind-mount inode). |
+| `app/configwrite.py` | Persists console edits into `CONFIG_PATH` via a **ruamel.yaml round-trip** (comments/key order/quoting preserved). `persist_model_priorities`, `set_enabled_models`, `set_aliases`, `set_logical_model`, `delete_logical_model` — each returns `(ok, reason)`. Abort-don't-corrupt; in-place write (bind-mount inode). |
 | `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump + the config hot-reload watcher). Also the `/admin/*` API + `/ui` static mount that back the web console. |
 | `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
@@ -121,15 +121,34 @@ decompresses the response. Single process, async, one uvicorn worker.
   the console polls that every second — and out of stdout, which is what separates it
   from `LOG_INPUT`/`LOG_OUTPUT`: those go to the log shipper, this does not. It is
   auth-gated like every other `/admin/*` route because it holds prompt text.
-- **Config write-back (`configwrite.py`).** Persisting a routing edit rewrites ONLY
-  the `priority: N` digits of the matched flow-style target lines; never re-emit the
-  file through a YAML dumper (comments/format must survive — the config is
-  git-tracked on the deploy host). The write must be **in-place** (`r+` + truncate):
-  `/app/config.yaml` is a single-file bind mount, so replace-by-rename detaches from
-  the host inode. Abort-don't-corrupt: any surprise (unmatched target, no
-  `priority:` field, failed parse-back self-check) returns `(False, reason)` with
-  the file untouched; the live change stands and the endpoint reports
-  `persisted: false`. Persist failures are warnings, never 500s.
+- **Config write-back (`configwrite.py`) round-trips through ruamel, never PyYAML.**
+  The config is a hand-annotated, git-tracked file on the deploy host, so a write
+  must preserve comments — `yaml.dump` would erase all 31 of them. Use `_yaml()`;
+  its `indent(mapping=2, sequence=4, offset=2)` reproduces this project's list
+  indentation (ruamel's default collapses it and inflates the diff five-fold) and
+  `preserve_quotes`/`width=4096` stop quote and line-wrap churn. Intra-flow
+  alignment padding is the one thing ruamel cannot keep; that normalizes once.
+  The write must be **in-place** (`r+` + truncate): `/app/config.yaml` is a
+  single-file bind mount, so replace-by-rename detaches from the host inode.
+  Abort-don't-corrupt: every mutation is serialized, re-parsed with plain PyYAML,
+  and self-checked to contain exactly the requested change before the file is
+  opened — plus a hard guard that the provider list is unchanged, since adding or
+  dropping a backend is the blast radius that takes routing down. Any surprise
+  returns `(False, reason)` with the file untouched. Persist failures are warnings,
+  never 500s.
+- **A target's `model` is inherited when omitted — preserve that through an edit.**
+  `Target.model is None` means "resolve via the provider's `model_map`", and
+  `configwrite._native_for` is the single place that resolution lives (mirroring
+  `router._from_logical`). Both sides of a priority write need it: callers hand over
+  live `Target`s where an inherited id is still `None`, while the file must be matched
+  on the id it resolves to. The config API likewise reports `model` raw and
+  `resolved_model` separately — collapsing them would make the editor write explicit
+  pins for every inherited target on the first save, changing what the config means
+  without changing what it says.
+- **`api_key` never leaves the process, including through the config editor.**
+  `_config_snapshot` emits `has_api_key`, never the value; `configwrite` reads and
+  writes key lines back verbatim without ever returning one. Any new config endpoint
+  must keep that property.
 - **In-flight registry (`inflight.py`) has exactly one closer per entry.** `proxy_request`
   opens the entry and closes it for every response *except* a `StreamingResponse` — that
   one is still in flight when the handler returns, so `_handle_stream`'s generator closes

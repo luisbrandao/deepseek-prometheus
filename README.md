@@ -349,9 +349,13 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
 | `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
-| `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
+| `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
 | `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
+| `/admin/config` | `GET` | The editable config: providers (no secrets), logical models, aliases, routing |
+| `/admin/config/providers/{name}/enabled-models` | `PUT` | Set a backend's upstream allow-list (`[]` = allow all, live discovery) |
+| `/admin/config/aliases` | `PUT` | Replace the alias map |
+| `/admin/config/models/{name}` | `PUT` / `DELETE` | Create, replace or drop a logical model (group) |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
 
 All `/admin/*` endpoints are gated by the same bearer keys as `POST /logging` (the
@@ -362,7 +366,7 @@ and never serialize provider `api_key`s.
 
 A built-in, dependency-free dashboard served by the proxy itself — open
 `http://<host>:9999/ui/` and paste a proxy key (stored in your browser's
-`localStorage`, sent as `Authorization: Bearer`). Four tabs:
+`localStorage`, sent as `Authorization: Bearer`). Five tabs:
 
 - **Logging** — live log tail (level filter, pause, autoscroll) plus the
   `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
@@ -397,6 +401,19 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   - The toolbar totals running / queued / done and shows each provider's `in_use/slots`,
     amber when full — so a growing queue reads straight against the capacity causing it.
     See [Slots, priority & queueing](#slots-priority--queueing).
+- **Config** — edit `config.yaml` from the browser; every save rewrites the file
+  (comments preserved) and takes effect immediately, no restart.
+  - **Upstream models** — per backend, either *allow all* (use whatever it live-reports)
+    or an explicit list. **Probe backend** fetches its real catalog as checkboxes; an id
+    that is pinned but no longer reported stays visible and checked, marked
+    *not in catalog*, so saving cannot silently drop it.
+  - **Model groups** — add, edit and delete logical models: pick each target's backend,
+    native id (blank inherits from `model_map`) and priority.
+  - **Aliases** — add, edit and delete short names. An alias pointing at an unknown
+    provider is refused rather than written, since an alias resolves ahead of everything
+    else and a broken one silently breaks a model name.
+  - `api_key` values are never sent to the browser; a provider shows only whether one is
+    set. Editing secrets and adding/removing whole providers stay file-side for now.
 
 #### Killing a request
 
@@ -423,22 +440,40 @@ Each kill is logged at `WARNING` with the request id, model, backend and elapsed
   the number. Edits apply immediately **and are written back into the config file**.
   Auto-grouped models and aliases are shown read-only.
 
-#### Runtime routing persistence
+#### How console edits reach the file
 
-A priority change saved in the Routing tab is persisted into `config.yaml` with a
-**surgical rewrite**: only the `priority: N` digits on the matching target lines
-change — comments, alignment and everything else are preserved byte-for-byte, so a
-git-tracked config shows a minimal, reviewable diff. Requirements & behavior:
+Every console edit rewrites `config.yaml` through a **ruamel.yaml round-trip**, so
+comments, key order, quoting and blank lines survive. Measured on this project's own
+production config (189 lines, 31 comments): a round-trip keeps every comment and
+produces a semantically identical document. The one irreducible change is
+hand-alignment *padding inside flow maps* —
+`{provider: nanoGPT,␣␣␣␣␣␣priority: 2}` becomes `{provider: nanoGPT,␣priority: 2}`,
+because ruamel does not track intra-flow spacing. That normalization happens **once**,
+on the first console write.
+
+Requirements & behavior:
 
 - The config volume must be mounted **read-write** (the bundled compose does this).
-  On a `:ro` mount the change still applies live, the response/UI report
-  *"not persisted"*, and the file is untouched; the Routing tab shows a
-  `config: read-only` warning badge.
-- Targets must use the flow style used throughout this README:
-  `- {provider: X, model: "Y", priority: N}` (one per line). Unrecognized layouts
-  are refused cleanly (live-only), never rewritten.
-- The rewritten text is parsed back and verified against the request **before**
-  the file is written — a failed check aborts with the file untouched.
+  On a `:ro` mount the change is refused with *"not persisted"* and the file is
+  untouched; the Config and Routing tabs show a read-only warning.
+- **Abort-don't-corrupt.** Every edit is serialized, re-parsed with plain PyYAML, and
+  checked to contain exactly the requested change *before* the file is opened for
+  writing. A mutation may never add or remove a provider — that guard is explicit.
+  Any surprise aborts with a reason and leaves the file byte-identical.
+- The write is **in-place** (`r+` + truncate), never write-temp-then-rename:
+  `/app/config.yaml` is a single-file bind mount, so a rename would detach from the
+  host inode.
+- The edit is applied to the live process before the response returns, so the console
+  re-renders from the file rather than from what it hoped it wrote.
+- `api_key` values are read and written back verbatim and **never** leave the process.
+  A provider reports only `has_api_key`.
+
+**Inherited vs. explicit native ids.** A target's `model:` may be omitted, meaning
+"inherit the native id from this provider's `model_map`". The editor keeps that
+distinction: an inherited target shows an empty field with the resolved id as a
+greyed `inherits …` placeholder, and saving it unchanged does **not** write an
+explicit pin. Otherwise opening a group and pressing Save would silently harden every
+inherited id — changing what the config means without changing what it says.
 
 ### `/models` aggregation
 
@@ -606,7 +641,8 @@ Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOK
 - **FastAPI** + **uvicorn** — async ASGI
 - **httpx** — async client with streaming
 - **prometheus-client** — native metrics
-- **PyYAML** — config
+- **PyYAML** — config parsing
+- **ruamel.yaml** — comment-preserving config *writes* from the console
 - **Python 3.11**
 
 ## License

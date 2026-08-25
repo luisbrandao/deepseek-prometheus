@@ -69,6 +69,7 @@ function activateTab(name) {
   if (name === "inflight") startFlightPolling(); else stopFlightPolling();
   if (name === "models") loadCatalog();
   if (name === "routing") loadRouting();
+  if (name === "config") loadConfig();
 }
 
 /* ── Logging: flags ────────────────────────────────────────── */
@@ -698,6 +699,376 @@ function timeCell(label, value) {
   return c;
 }
 
+
+/* ── Config: edit the config file from the browser ──────────── */
+/* Every save is a PUT that rewrites config.yaml (comments preserved) and is
+ * applied to the live process before the response returns — so the response
+ * carries the fresh snapshot and we re-render from that, never from what we
+ * hoped we wrote. Sections save independently: these are file writes, so they
+ * are explicit rather than as-you-type. */
+let cfg = null;                       // last snapshot from the server
+const cfgCatalog = new Map();         // provider -> {loading, ids, error}
+let cfgNewModelName = "";
+
+async function loadConfig() {
+  let res;
+  try { res = await api("/admin/config"); }
+  catch { $("#cfg-body").innerHTML = '<div class="notice">Cannot reach the proxy.</div>'; return; }
+  if (res.status === 403) {
+    $("#cfg-body").innerHTML = '<div class="notice">Unauthorized — set a valid bearer key to edit the config.</div>';
+    $("#cfg-path").textContent = ""; $("#cfg-writable").textContent = "";
+    return;
+  }
+  if (!res.ok) { $("#cfg-body").innerHTML = '<div class="notice">Failed to load the config.</div>'; return; }
+  cfg = await res.json();
+  renderConfig();
+}
+
+// Shared tail for every mutation: a 2xx carries the new snapshot, a 4xx carries
+// {error}. Either way the UI ends up showing the server's truth.
+async function cfgSave(path, method, body, what) {
+  let res;
+  try {
+    res = await api(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch { toast("Save failed — cannot reach the proxy", "bad"); return false; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.persisted === false) {
+    toast(data.error || `Save failed (${res.status})`, "bad");
+    if (data.providers) { cfg = data; renderConfig(); }
+    return false;
+  }
+  cfg = data;
+  renderConfig();
+  toast(what + " saved to " + (cfg.path || "config"));
+  return true;
+}
+
+function renderConfig() {
+  $("#cfg-path").textContent = cfg.path || "";
+  const w = $("#cfg-writable");
+  if (cfg.writable) {
+    w.textContent = "file: writable";
+    w.style.color = "";
+  } else {
+    w.textContent = "file: read-only — edits cannot be saved";
+    w.style.color = "var(--amber)";
+  }
+  const body = $("#cfg-body");
+  body.innerHTML = "";
+  body.appendChild(cfgUpstreamSection());
+  body.appendChild(cfgGroupsSection());
+  body.appendChild(cfgAliasSection());
+}
+
+const cfgDisabled = () => !cfg.writable;
+
+/* ── Upstream models per provider ─────────────────────────── */
+function cfgUpstreamSection() {
+  const wrap = el("div", "cfgsec");
+  wrap.appendChild(el("h2", null, "Upstream models"));
+  wrap.appendChild(el("div", "hint",
+    "Which native model ids each backend is allowed to serve. " +
+    "Allow all means the proxy uses whatever the backend live-reports — add an " +
+    "explicit list to pin it down."));
+  for (const p of cfg.providers) wrap.appendChild(cfgProviderCard(p));
+  return wrap;
+}
+
+function cfgProviderCard(p) {
+  const card = el("div", "mcard");
+  const head = el("div", "mhead");
+  head.appendChild(el("span", "mname", p.name));
+  head.appendChild(el("span", "mtcount muted", p.base_url));
+  if (p.require_permission) {
+    const lock = el("span", "fltag", "🔒 key required");
+    lock.title = "hidden from callers without a proxy key";
+    head.appendChild(lock);
+  }
+  head.appendChild(el("span", "fltag", p.lists_all ? "allow all" : p.enabled_models.length + " pinned"));
+  card.appendChild(head);
+
+  const body = el("div", "cfgcard");
+  let mode = p.lists_all ? "all" : "list";
+  let chosen = new Set(p.enabled_models);
+
+  const modes = el("div", "cfgmodes");
+  const mk = (value, label, title) => {
+    const b = el("button", "btn tiny" + (mode === value ? " primary" : ""), label);
+    b.title = title;
+    b.onclick = () => { mode = value; draw(); };
+    return b;
+  };
+  const list = el("div", "cfglist");
+  const actions = el("div", "cfgactions");
+
+  function draw() {
+    modes.innerHTML = "";
+    modes.append(
+      mk("all", "Allow all (live discovery)", "expose every model this backend reports"),
+      mk("list", "Only these", "restrict to an explicit list of native ids"),
+    );
+    list.innerHTML = "";
+    if (mode === "all") {
+      list.appendChild(el("div", "hint",
+        "Everything this backend reports from /v1/models is available. " +
+        "Its catalog is refreshed every " + p.cache_ttl + "s."));
+    } else {
+      list.appendChild(catalogPicker(p, chosen, draw));
+    }
+    actions.innerHTML = "";
+    const save = el("button", "btn primary", "Save");
+    save.disabled = cfgDisabled();
+    save.onclick = () => cfgSave(
+      `/admin/config/providers/${encodeURIComponent(p.name)}/enabled-models`,
+      "PUT", { models: mode === "all" ? [] : Array.from(chosen) }, p.name);
+    const reset = el("button", "btn", "Reset");
+    reset.onclick = () => { mode = p.lists_all ? "all" : "list"; chosen = new Set(p.enabled_models); draw(); };
+    actions.append(reset, save);
+  }
+  draw();
+  body.append(modes, list, actions);
+  card.appendChild(body);
+  return card;
+}
+
+function catalogPicker(p, chosen, redraw) {
+  const box = el("div", "cfgpick");
+  const st = cfgCatalog.get(p.name);
+  const head = el("div", "cfgpickhead");
+  const probe = el("button", "btn tiny", st && st.ids ? "Re-probe" : "Probe backend");
+  probe.title = "ask this backend for its full model list";
+  probe.onclick = () => probeProvider(p.name, redraw);
+  head.append(el("span", "muted", Array.from(chosen).length + " selected"), probe);
+  box.appendChild(head);
+
+  if (st && st.loading) { box.appendChild(el("div", "muted", "probing…")); return box; }
+  if (st && st.error) { box.appendChild(el("div", "uerr", st.error)); }
+
+  // Union of the probed catalog and whatever is already pinned: an id the
+  // backend no longer reports must stay visible and checked, or saving would
+  // silently drop it.
+  const ids = new Set(st && st.ids ? st.ids : []);
+  const all = Array.from(new Set([...ids, ...chosen])).sort();
+  if (!all.length) {
+    box.appendChild(el("div", "hint", "Probe the backend to list what it serves, or type ids below."));
+  }
+  const grid = el("div", "cfgcheckgrid");
+  for (const id of all) {
+    const row = el("label", "cfgcheck");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = chosen.has(id);
+    cb.onchange = () => { cb.checked ? chosen.add(id) : chosen.delete(id); redraw(); };
+    row.append(cb, el("span", "cfgcheckid", id));
+    if (!ids.has(id) && st && st.ids) {
+      const warn = el("span", "fltag warn", "not in catalog");
+      warn.title = "pinned here but the backend no longer reports it";
+      row.appendChild(warn);
+    }
+    grid.appendChild(row);
+  }
+  box.appendChild(grid);
+
+  // Manual entry, for a backend that can't be probed (or an id it hides).
+  const add = el("div", "cfgadd");
+  const input = el("input"); input.type = "text"; input.placeholder = "add a native model id…";
+  input.className = "cfginput";
+  const btn = el("button", "btn tiny", "Add");
+  const doAdd = () => {
+    const v = input.value.trim();
+    if (!v) return;
+    chosen.add(v); input.value = ""; redraw();
+  };
+  btn.onclick = doAdd;
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doAdd(); } });
+  add.append(input, btn);
+  box.appendChild(add);
+  return box;
+}
+
+async function probeProvider(name, redraw) {
+  cfgCatalog.set(name, { loading: true });
+  redraw();
+  try {
+    const res = await api("/admin/upstream-models?provider=" + encodeURIComponent(name));
+    const data = await res.json();
+    const entry = (data.providers || [])[0];
+    if (!entry) cfgCatalog.set(name, { error: "no response for " + name });
+    else if (entry.ok) cfgCatalog.set(name, { ids: entry.ids });
+    else cfgCatalog.set(name, { error: entry.error || "probe failed" });
+  } catch {
+    cfgCatalog.set(name, { error: "probe failed — cannot reach the proxy" });
+  }
+  redraw();
+}
+
+/* ── Model groups (logical models) ────────────────────────── */
+function cfgGroupsSection() {
+  const wrap = el("div", "cfgsec");
+  wrap.appendChild(el("h2", null, "Model groups"));
+  wrap.appendChild(el("div", "hint",
+    "One client-facing name in front of an ordered list of backends. Lower priority " +
+    "wins; equal priorities share load. Leave the native id blank to inherit it from " +
+    "the backend's model_map."));
+  for (const m of cfg.logical_models) wrap.appendChild(cfgGroupCard(m));
+
+  const add = el("div", "cfgnew");
+  const input = el("input"); input.type = "text"; input.className = "cfginput";
+  input.placeholder = "new group name, e.g. local.my-model";
+  input.value = cfgNewModelName;
+  input.oninput = () => { cfgNewModelName = input.value; };
+  const btn = el("button", "btn primary", "Create group");
+  btn.disabled = cfgDisabled();
+  btn.onclick = async () => {
+    const name = input.value.trim();
+    if (!name) { toast("Give the group a name", "bad"); return; }
+    const first = cfg.providers[0];
+    if (await cfgSave(`/admin/config/models/${encodeURIComponent(name)}`, "PUT",
+                      { targets: [{ provider: first.name, priority: 1 }] }, name)) {
+      cfgNewModelName = "";
+    }
+  };
+  add.append(input, btn);
+  wrap.appendChild(add);
+  return wrap;
+}
+
+function cfgGroupCard(m) {
+  const card = el("div", "mcard");
+  let targets = m.targets.map((t) => ({ ...t }));
+
+  const head = el("div", "mhead");
+  head.appendChild(el("span", "mname", m.name));
+  head.appendChild(el("span", "mtcount muted",
+    targets.length + (targets.length === 1 ? " target" : " targets")));
+  const actions = el("div", "mactions");
+  head.appendChild(actions);
+  card.appendChild(head);
+  const list = el("div", "cfgcard");
+  card.appendChild(list);
+
+  function draw() {
+    list.innerHTML = "";
+    targets.forEach((t, i) => {
+      const row = el("div", "cfgtrow");
+      const sel = el("select"); sel.className = "cfgsel";
+      for (const p of cfg.providers) {
+        const o = el("option", null, p.name);
+        o.value = p.name;
+        if (p.name === t.provider) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.onchange = () => { t.provider = sel.value; };
+
+      const mid = el("input"); mid.type = "text"; mid.className = "cfginput mono";
+      // Empty means "inherit from the backend's model_map" — the placeholder shows
+      // what that currently resolves to, so leaving it blank is informed rather
+      // than a guess.
+      mid.value = t.model || "";
+      mid.placeholder = t.resolved_model ? "inherits " + t.resolved_model : "native id (blank = inherit)";
+      mid.title = "leave blank to inherit the native id from the backend's model_map";
+      mid.onchange = () => { t.model = mid.value.trim(); };
+
+      const prio = el("input"); prio.type = "number"; prio.min = "1"; prio.className = "cfgprio";
+      prio.value = t.priority;
+      prio.onchange = () => {
+        const v = parseInt(prio.value, 10);
+        t.priority = Number.isFinite(v) && v > 0 ? v : 1;
+        prio.value = t.priority;
+      };
+
+      const del = el("button", "mini", "✕");
+      del.title = "remove this target";
+      del.onclick = () => { targets.splice(i, 1); draw(); };
+
+      row.append(sel, mid, el("span", "muted", "priority"), prio, del);
+      list.appendChild(row);
+    });
+    const addRow = el("div", "cfgtrow");
+    const addBtn = el("button", "btn tiny", "+ Add target");
+    addBtn.onclick = () => {
+      targets.push({ provider: cfg.providers[0].name, model: "", resolved_model: "", priority: targets.length + 1 });
+      draw();
+    };
+    addRow.appendChild(addBtn);
+    list.appendChild(addRow);
+
+    actions.innerHTML = "";
+    const del = el("button", "btn", "Delete group");
+    del.disabled = cfgDisabled();
+    del.onclick = () => cfgSave(`/admin/config/models/${encodeURIComponent(m.name)}`,
+                                "DELETE", undefined, m.name + " (deleted)");
+    const reset = el("button", "btn", "Reset");
+    reset.onclick = () => { targets = m.targets.map((t) => ({ ...t })); draw(); };
+    const save = el("button", "btn primary", "Save");
+    save.disabled = cfgDisabled();
+    save.onclick = () => {
+      if (!targets.length) { toast("A group needs at least one target", "bad"); return; }
+      cfgSave(`/admin/config/models/${encodeURIComponent(m.name)}`, "PUT", {
+        targets: targets.map((t) => ({
+          provider: t.provider, priority: t.priority,
+          ...(t.model ? { model: t.model } : {}),
+        })),
+      }, m.name);
+    };
+    actions.append(del, reset, save);
+  }
+  draw();
+  return card;
+}
+
+/* ── Aliases ──────────────────────────────────────────────── */
+function cfgAliasSection() {
+  const wrap = el("div", "cfgsec");
+  wrap.appendChild(el("h2", null, "Aliases"));
+  wrap.appendChild(el("div", "hint",
+    "A short name that resolves to something else — a bare model name, or " +
+    "provider:model to pin one backend. Aliases are resolved first, ahead of groups."));
+  let rows = Object.entries(cfg.aliases).map(([k, v]) => ({ k, v }));
+  const list = el("div", "cfgcard");
+  const actions = el("div", "cfgactions");
+
+  function draw() {
+    list.innerHTML = "";
+    rows.forEach((r, i) => {
+      const row = el("div", "cfgtrow");
+      const k = el("input"); k.type = "text"; k.className = "cfginput mono"; k.value = r.k;
+      k.placeholder = "alias"; k.onchange = () => { r.k = k.value.trim(); };
+      const v = el("input"); v.type = "text"; v.className = "cfginput mono"; v.value = r.v;
+      v.placeholder = "target model or provider:model";
+      v.onchange = () => { r.v = v.value.trim(); };
+      const del = el("button", "mini", "✕");
+      del.onclick = () => { rows.splice(i, 1); draw(); };
+      row.append(k, el("span", "aarrow", "→"), v, del);
+      list.appendChild(row);
+    });
+    if (!rows.length) list.appendChild(el("div", "hint", "No aliases."));
+    const addRow = el("div", "cfgtrow");
+    const addBtn = el("button", "btn tiny", "+ Add alias");
+    addBtn.onclick = () => { rows.push({ k: "", v: "" }); draw(); };
+    addRow.appendChild(addBtn);
+    list.appendChild(addRow);
+  }
+  draw();
+
+  const save = el("button", "btn primary", "Save aliases");
+  save.disabled = cfgDisabled();
+  save.onclick = () => {
+    const out = {};
+    for (const r of rows) {
+      if (!r.k || !r.v) { toast("Every alias needs a name and a target", "bad"); return; }
+      if (out[r.k]) { toast("Duplicate alias '" + r.k + "'", "bad"); return; }
+      out[r.k] = r.v;
+    }
+    cfgSave("/admin/config/aliases", "PUT", { aliases: out }, "Aliases");
+  };
+  actions.appendChild(save);
+  wrap.append(list, actions);
+  return wrap;
+}
+
 /* ── Routing ───────────────────────────────────────────────── */
 async function loadRouting() {
   let res;
@@ -760,7 +1131,8 @@ function modelCard(model, downSet) {
 
   const head = el("div", "mhead");
   head.appendChild(el("span", "mname", model.name));
-  head.appendChild(el("span", "mtcount muted", targets.length + " targets"));
+  head.appendChild(el("span", "mtcount muted",
+    targets.length + (targets.length === 1 ? " target" : " targets")));
   const actions = el("div", "mactions");
   const resetBtn = el("button", "btn", "Reset");
   const saveBtn = el("button", "btn primary", "Save");
@@ -897,6 +1269,7 @@ function initKey() {
     if (active === "inflight") pollFlight();
     if (active === "models") { loadCatalog(); }
     if (active === "routing") loadRouting();
+    if (active === "config") loadConfig();
   };
   $("#save-key").addEventListener("click", save);
   $("#api-key").addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
@@ -922,6 +1295,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#models-refresh").addEventListener("click", loadCatalog);
   $("#models-probe").addEventListener("click", probeUpstreams);
   $("#routing-refresh").addEventListener("click", loadRouting);
+  $("#cfg-refresh").addEventListener("click", loadConfig);
 
   loadLogFlags();
   activateTab("logging");

@@ -1,39 +1,73 @@
-"""Persist runtime routing edits back into the config file, surgically.
+"""Persist console edits back into the config file, comments and all.
 
-`POST /admin/routing/{model}` changes target priorities in memory; this module
-makes that change durable by rewriting **only the `priority: N` digits** on the
-matching target lines of `CONFIG_PATH`. Everything else — comments, alignment,
-key order, quoting — is preserved byte-for-byte, so the file stays pleasant to
-read and a GitOps working tree shows a minimal, reviewable diff.
+The web console is the intended way to change routing, upstream allow-lists,
+logical models and aliases; this module is what makes those edits durable. It
+loads `CONFIG_PATH` through ruamel.yaml's round-trip parser, mutates the parsed
+document in place, and writes it back — so comments, key order, quoting and
+blank lines survive, which matters because the config is a hand-annotated,
+git-tracked file on the deploy host.
 
-Why not a YAML round-trip? PyYAML drops every comment; ruamel.yaml (a new
-dependency) re-emits the whole file and normalizes whitespace file-wide, which
-turns the first runtime edit into a noisy diff. Targeted text surgery has
-neither problem, at the cost of only supporting the flow style this project
-already uses everywhere: `- {provider: X, model: "Y", priority: N}`.
+## Formatting fidelity
 
-Safety model: abort-don't-corrupt. Any surprise — a target line the regex can't
-read, a target present in the file but not in the request (or vice versa), a
-failed parse-back self-check — aborts the persist with a reason, leaving the
-file untouched. The caller keeps the live in-memory change and reports the
-failure; it never half-writes.
+Measured against this project's production config (189 lines, 31 comments): a
+round-trip preserves every comment and produces a semantically identical
+document, changing 48 lines — all of it hand-alignment *padding inside flow
+maps* (`{provider: nanoGPT,       priority: 2}` loses its column alignment).
+ruamel does not track intra-flow spacing, so that normalization is irreducible
+and happens once, on the first console write. `_YAML` is configured to keep
+everything ruamel *can* keep: `sequence=4, offset=2` reproduces this project's
+two-space-then-dash list indentation (the default collapses it and inflates the
+diff five-fold), `preserve_quotes` keeps `"..."` as written, and a very wide
+`width` stops long lines being re-wrapped.
+
+## Safety model: abort-don't-corrupt
+
+Every mutation validates before it writes, and any surprise aborts with a reason
+while leaving the file untouched:
+
+* the target of the edit must exist (unknown provider, unknown model → refuse),
+* the edited document is re-serialized to text, parsed back with **plain PyYAML**
+  (the parser the app itself uses), and the parsed result must contain exactly
+  the change that was requested,
+* the provider set must survive the edit — no mutation here may add or remove a
+  backend, which is the blast radius that would take routing down,
+* the file must still be writable (a `:ro` mount reports `persisted: false` and
+  the caller keeps its live change).
+
+Callers get `(ok, reason)` and must treat a failure as a warning, never a 500.
 
 The write is IN-PLACE (`r+` + truncate), never write-temp-then-rename:
 `/app/config.yaml` is a single-file bind mount, so the mount is pinned to the
 host file's inode — a rename would swap the directory entry while the container
 keeps the old inode (and renaming over a mount point fails outright). The
 content is fully validated in memory before the file is opened for writing.
+
+Secrets are never touched: `api_key` values are read and written back verbatim as
+the document holds them, and no function here returns one to a caller.
 """
 import asyncio
+import io
 import logging
 import os
-import re
 
-import yaml
+import yaml as pyyaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from app import config as conf
 
 logger = logging.getLogger("llm-proxy")
+
+
+def _yaml() -> YAML:
+    """A round-trip parser tuned to this project's formatting (see module doc)."""
+    y = YAML()
+    y.preserve_quotes = True
+    y.width = 4096
+    y.indent(mapping=2, sequence=4, offset=2)
+    return y
+
 
 # Serializes the read-modify-write cycle. Created lazily so it binds to the
 # running loop, matching the convention in slots/registry.
@@ -47,128 +81,289 @@ def _lock_for() -> asyncio.Lock:
     return _lock
 
 
-_MODELS_RE = re.compile(r"^models:\s*(#.*)?$")
-_TARGET_RE = re.compile(r"-\s*\{(.*)\}")
-_PROVIDER_RE = re.compile(r"provider:\s*([^,}\s]+)")
-_MODEL_RE = re.compile(r'model:\s*("(?:[^"]*)"|[^,}]+)')
-_PRIORITY_RE = re.compile(r"(priority:\s*)(\d+)")
-
-
 def config_writable() -> bool:
     """Whether the config file accepts writes (False on a `:ro` bind mount)."""
     return os.access(conf.CONFIG_PATH, os.W_OK)
 
 
-def _rewrite(text: str, model_name: str, wanted: dict):
-    """Return (new_text, None) with priorities rewritten, or (None, reason).
+def _read_text() -> str:
+    with open(conf.CONFIG_PATH, "r", encoding="utf-8") as f:
+        return f.read()
 
-    `wanted` maps (provider, model-or-None) -> new priority, where `model` is the
-    target's as-written value (None when inherited via model_map) — the same
-    identity the config loader produces, so it matches the YAML line exactly.
-    Matching is by key, never by position: file order and priority order already
-    diverge in real configs.
+
+def _write_text(text: str) -> None:
+    """In-place overwrite. See the module docstring for why not rename()."""
+    with open(conf.CONFIG_PATH, "r+", encoding="utf-8") as f:
+        f.write(text)
+        f.truncate()
+
+
+def _serialize(doc) -> str:
+    buf = io.StringIO()
+    _yaml().dump(doc, buf)
+    return buf.getvalue()
+
+
+def _native_for(model_name: str, provider_name: str, native):
+    """The native wire id a target uses: its explicit `model`, else the logical name
+    reverse-mapped through the provider's model_map.
+
+    Mirrors `router._from_logical`. Needed on both sides of a priority write: the
+    caller hands us `Target`s straight out of the live config, where an inherited
+    id is still `None`, while the file has to be matched on the id it actually
+    resolves to.
     """
-    lines = text.split("\n")
-
-    # Bound the top-level `models:` section (ends at the next column-0 key).
-    start = next((i for i, l in enumerate(lines) if _MODELS_RE.match(l)), None)
-    if start is None:
-        return None, "no top-level 'models:' section in config"
-    end = next(
-        (i for i in range(start + 1, len(lines)) if lines[i] and lines[i][0] not in " #"),
-        len(lines),
-    )
-
-    # Find this model's key line within the section.
-    key_re = re.compile(r"^(\s+)" + re.escape(model_name) + r":\s*(#.*)?$")
-    key_at = next((i for i in range(start + 1, end) if key_re.match(lines[i])), None)
-    if key_at is None:
-        return None, f"model '{model_name}' not found under models:"
-    indent = len(key_re.match(lines[key_at]).group(1))
-
-    # Walk the model's block (until a line dedents back to key level or less)
-    # and rewrite each flow-style target line.
-    matched = set()
-    for i in range(key_at + 1, end):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and len(line) - len(line.lstrip()) <= indent:
-            break  # next model
-        t = _TARGET_RE.search(line)
-        if not t:
-            continue
-        body = t.group(1)
-        pm = _PROVIDER_RE.search(body)
-        if not pm:
-            return None, f"target line without provider: {stripped}"
-        mm = _MODEL_RE.search(body)
-        key = (pm.group(1), mm.group(1).strip().strip('"') if mm else None)
-        if key not in wanted:
-            return None, f"config target {key} not in the request (out of sync?)"
-        if key in matched:
-            return None, f"duplicate target {key} in config"
-        if not _PRIORITY_RE.search(line):
-            return None, f"target line without a priority field: {stripped}"
-        matched.add(key)
-        lines[i] = _PRIORITY_RE.sub(lambda m: m.group(1) + str(wanted[key]), line, count=1)
-
-    if matched != set(wanted):
-        missing = set(wanted) - matched
-        return None, f"targets not found as flow-style lines in config: {sorted(missing)}"
-    return "\n".join(lines), None
+    if native is not None:
+        return native
+    p = conf.PROVIDERS_BY_NAME.get(provider_name)
+    return p.to_native(model_name) if p else model_name
 
 
-def _self_check(new_text: str, model_name: str, wanted: dict):
-    """Parse the rewritten text and verify it means exactly what was requested."""
-    try:
-        data = yaml.safe_load(new_text)
-        got = {
-            (t["provider"], t.get("model")): int(t.get("priority", 100))
-            for t in data["models"][model_name]["targets"]
-        }
-    except Exception as e:  # noqa: BLE001 - any parse trouble means do not write
-        return f"rewritten config failed to parse: {type(e).__name__}: {e}"
-    if got != wanted:
-        return f"self-check mismatch after rewrite: {got} != {wanted}"
+def _providers_of(doc):
+    return doc.get("providers") or []
+
+
+def _find_provider(doc, name: str):
+    for entry in _providers_of(doc):
+        if entry.get("name") == name:
+            return entry
     return None
 
 
-async def persist_model_priorities(model_name: str, targets) -> tuple:
-    """Write the given targets' priorities into CONFIG_PATH. -> (ok, reason).
+def _commit(doc, before_text: str, check):
+    """Serialize, validate, write. Returns `(ok, reason)`.
 
-    `targets` are the live, already-updated `LogicalModel.targets`. Failure never
-    raises and never partially writes; the caller decides how to surface it.
+    `check(parsed)` inspects the re-parsed document and returns None when the
+    requested change is present and correct, or a reason string when it is not.
+    Nothing is written unless that passes — a mutation that didn't take effect the
+    way we intended must not reach the file.
     """
-    wanted = {(t.provider, t.model): t.priority for t in targets}
-    if len(wanted) != len(targets):
-        return False, "duplicate (provider, model) among targets"
+    try:
+        text = _serialize(doc)
+    except Exception as e:  # noqa: BLE001 - never raise into a request
+        return False, f"could not serialize config: {type(e).__name__}: {e}"
 
+    try:
+        parsed = pyyaml.safe_load(text)
+    except Exception as e:  # noqa: BLE001
+        return False, f"rewritten config does not parse: {type(e).__name__}: {e}"
+    if not isinstance(parsed, dict):
+        return False, "rewritten config is not a mapping"
+
+    # A mutation here must never change which backends exist.
+    before = pyyaml.safe_load(before_text) or {}
+    names_before = [p.get("name") for p in (before.get("providers") or [])]
+    names_after = [p.get("name") for p in (parsed.get("providers") or [])]
+    if names_before != names_after:
+        return False, "refusing to write: the provider list changed"
+
+    problem = check(parsed)
+    if problem:
+        return False, problem
+
+    if not config_writable():
+        return False, "config file is not writable (read-only mount?)"
+    try:
+        _write_text(text)
+    except OSError as e:
+        return False, f"could not write config: {e}"
+    return True, None
+
+
+async def _edit(mutate, check):
+    """Load → mutate → validate → write, serialized against concurrent edits."""
     async with _lock_for():
         try:
-            with open(conf.CONFIG_PATH) as f:
-                text = f.read()
-        except OSError as e:
-            return False, f"cannot read config: {e}"
+            before = _read_text()
+            doc = _yaml().load(before)
+        except Exception as e:  # noqa: BLE001
+            return False, f"could not read config: {type(e).__name__}: {e}"
+        if not isinstance(doc, dict):
+            return False, "config is not a mapping"
+        problem = mutate(doc)
+        if problem:
+            return False, problem
+        return _commit(doc, before, check)
 
-        new_text, err = _rewrite(text, model_name, wanted)
-        if err:
-            return False, err
-        if new_text == text:
-            return True, None  # nothing to do (priorities already match)
 
-        err = _self_check(new_text, model_name, wanted)
-        if err:
-            return False, err
+# --- individual edits --------------------------------------------------------
 
-        try:
-            # In-place: keep the bind-mounted inode (see module docstring).
-            with open(conf.CONFIG_PATH, "r+") as f:
-                f.write(new_text)
-                f.truncate()
-        except OSError as e:
-            # Typically EROFS/EACCES on a read-only mount: expected on deploys
-            # that haven't switched the mount to rw yet.
-            return False, f"config not writable: {e}"
 
-    logger.info("Persisted routing priorities for '%s' to %s", model_name, conf.CONFIG_PATH)
-    return True, None
+async def persist_model_priorities(model: str, targets) -> tuple:
+    """Write a logical model's target priorities (the Routing tab's reorder).
+
+    Reorder only: the (provider, native model) set must match the file exactly,
+    so this can never invent or drop a target.
+    """
+    wanted = {
+        (t.provider, _native_for(model, t.provider, t.model)): t.priority for t in targets
+    }
+
+    def mutate(doc):
+        models = doc.get("models")
+        if not isinstance(models, dict) or model not in models:
+            return f"no '{model}' entry under models: in the config"
+        entries = (models[model] or {}).get("targets")
+        if not entries:
+            return f"'{model}' has no targets in the config"
+        seen = {}
+        for entry in entries:
+            provider = entry.get("provider")
+            key = (provider, _native_for(model, provider, entry.get("model")))
+            if key not in wanted:
+                return f"target {provider}/{native} is in the config but not in the request"
+            entry["priority"] = wanted[key]
+            seen[key] = True
+        missing = set(wanted) - set(seen)
+        if missing:
+            return f"requested target(s) not found in the config: {sorted(missing)}"
+        return None
+
+    def check(parsed):
+        entries = ((parsed.get("models") or {}).get(model) or {}).get("targets") or []
+        got = {}
+        for entry in entries:
+            provider = entry.get("provider")
+            got[(provider, _native_for(model, provider, entry.get("model")))] = entry.get("priority")
+        if got != wanted:
+            return "self-check failed: priorities in the rewritten file don't match the request"
+        return None
+
+    return await _edit(mutate, check)
+
+
+async def set_enabled_models(provider_name: str, models) -> tuple:
+    """Set a provider's `enabled_models` allow-list.
+
+    `models` is a list of native ids, or None/[] meaning "expose everything this
+    backend live-reports" (`Provider.lists_all`). Those two states are the whole
+    point of the upstream-models editor, so both must be writable.
+    """
+    wanted = [str(m) for m in (models or [])]
+
+    def mutate(doc):
+        entry = _find_provider(doc, provider_name)
+        if entry is None:
+            return f"unknown provider '{provider_name}'"
+        seq = CommentedSeq(wanted)
+        seq.fa.set_flow_style()  # keep short allow-lists on one line, as written
+        entry["enabled_models"] = seq
+        return None
+
+    def check(parsed):
+        for entry in parsed.get("providers") or []:
+            if entry.get("name") == provider_name:
+                got = entry.get("enabled_models") or []
+                if list(got) != wanted:
+                    return "self-check failed: enabled_models in the rewritten file don't match"
+                return None
+        return f"self-check failed: provider '{provider_name}' vanished"
+
+    return await _edit(mutate, check)
+
+
+async def set_aliases(aliases: dict) -> tuple:
+    """Replace the whole `aliases:` map. The console owns it as a unit — it is a
+    flat name→target dictionary, so per-key surgery would buy nothing."""
+    wanted = {str(k): str(v) for k, v in (aliases or {}).items()}
+
+    def mutate(doc):
+        if wanted:
+            existing = doc.get("aliases")
+            target = existing if isinstance(existing, CommentedMap) else CommentedMap()
+            for key in [k for k in target if k not in wanted]:
+                del target[key]
+            for key, value in wanted.items():
+                target[key] = value
+            doc["aliases"] = target
+        elif "aliases" in doc:
+            # An empty map reads as "no aliases"; drop the key rather than leaving
+            # `aliases: {}` behind.
+            del doc["aliases"]
+        return None
+
+    def check(parsed):
+        got = parsed.get("aliases") or {}
+        if {str(k): str(v) for k, v in got.items()} != wanted:
+            return "self-check failed: aliases in the rewritten file don't match"
+        return None
+
+    return await _edit(mutate, check)
+
+
+async def set_logical_model(name: str, targets) -> tuple:
+    """Create or replace one `models:` entry from `[{provider, model?, priority}]`.
+
+    Existing entries are mutated in place so their comments survive; a new entry
+    is appended in flow style, matching how they are written by hand here.
+    """
+    wanted = []
+    for t in targets:
+        item = {"provider": str(t["provider"]), "priority": int(t["priority"])}
+        native = t.get("model")
+        if native:
+            item["model"] = str(native)
+        wanted.append(item)
+
+    def mutate(doc):
+        models = doc.get("models")
+        if not isinstance(models, (dict, CommentedMap)):
+            models = CommentedMap()
+            doc["models"] = models
+        seq = CommentedSeq()
+        for item in wanted:
+            row = CommentedMap()
+            row["provider"] = item["provider"]
+            if "model" in item:
+                # Quoted, matching how native ids are written by hand throughout
+                # this config — an id like `local.qwen-medium:low` contains a colon
+                # and reads much less ambiguously with quotes.
+                row["model"] = DoubleQuotedScalarString(item["model"])
+            row["priority"] = item["priority"]
+            row.fa.set_flow_style()
+            seq.append(row)
+        existing = models.get(name)
+        if isinstance(existing, (dict, CommentedMap)):
+            existing["targets"] = seq
+        else:
+            entry = CommentedMap()
+            entry["targets"] = seq
+            models[name] = entry
+        return None
+
+    def check(parsed):
+        entry = (parsed.get("models") or {}).get(name)
+        if not isinstance(entry, dict):
+            return f"self-check failed: '{name}' missing from the rewritten file"
+        got = []
+        for row in entry.get("targets") or []:
+            item = {"provider": row.get("provider"), "priority": row.get("priority")}
+            if row.get("model"):
+                item["model"] = row["model"]
+            got.append(item)
+        if got != wanted:
+            return "self-check failed: targets in the rewritten file don't match"
+        return None
+
+    return await _edit(mutate, check)
+
+
+async def delete_logical_model(name: str) -> tuple:
+    """Remove one `models:` entry. Its clients fall back to whatever the plain
+    resolution order finds — usually auto-group across the same backends."""
+
+    def mutate(doc):
+        models = doc.get("models")
+        if not isinstance(models, (dict, CommentedMap)) or name not in models:
+            return f"no '{name}' entry under models: in the config"
+        del models[name]
+        if not models:
+            del doc["models"]
+        return None
+
+    def check(parsed):
+        if name in (parsed.get("models") or {}):
+            return f"self-check failed: '{name}' is still in the rewritten file"
+        return None
+
+    return await _edit(mutate, check)

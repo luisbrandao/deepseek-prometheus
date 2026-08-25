@@ -27,6 +27,7 @@
     <button class="tab" data-tab="inflight">In-flight</button>
     <button class="tab" data-tab="models">Models</button>
     <button class="tab" data-tab="routing">Routing</button>
+    <button class="tab" data-tab="config">Config</button>
   </nav>
 
   <main>
@@ -104,6 +105,19 @@
       <div id="aliases-wrap">
         <h2>Aliases <small class="muted">read-only</small></h2>
         <div id="aliases"></div>
+      </div>
+    </section>
+    <!-- ───────────────────────── CONFIG ───────────────────────── -->
+    <section id="tab-config" class="panel">
+      <div class="toolbar">
+        <button id="cfg-refresh" class="btn">Reload from file</button>
+        <span class="sep"></span>
+        <span id="cfg-path" class="muted"></span>
+        <span class="grow"></span>
+        <span id="cfg-writable" class="muted"></span>
+      </div>
+      <div id="cfg-body">
+        <div class="notice">Loading…</div>
       </div>
     </section>
   </main>

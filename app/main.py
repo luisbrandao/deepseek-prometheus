@@ -114,6 +114,31 @@ def _unify_logging() -> None:
         access.addFilter(_MutePollingFilter())
 
 
+async def _apply_config_change() -> bool:
+    """Pull a just-written config edit into the live process, now.
+
+    The watcher would find it within CONFIG_RELOAD_INTERVAL, but a console edit
+    has to be in effect before the response lands — otherwise the UI re-reads and
+    renders the pre-edit state, which reads as "my change didn't save". Same side
+    effects as the watcher: drop the discovery cache (allow-lists may have moved)
+    and wake slot waiters (capacity may have).
+    """
+    log = logging.getLogger("llm-proxy")
+    try:
+        if not conf.reload_if_changed():
+            return False
+    except Exception as e:  # noqa: BLE001 - a write we validated should parse, but
+        log.warning("Config written but reload failed: %s: %s", type(e).__name__, e)
+        return False
+    registry.clear_cache()
+    await slots.poke()
+    log.info(
+        "Config reloaded after a console edit: %d providers, %d logical models, %d aliases",
+        len(conf.PROVIDERS), len(conf.LOGICAL_MODELS), len(conf.ALIASES),
+    )
+    return True
+
+
 async def _config_reload_loop():
     """Hot-apply edits to the config file, no restart needed.
 
@@ -289,7 +314,7 @@ async def admin_logs(request: Request, since: int = 0, level: str = "DEBUG"):
 
 
 @app.get("/admin/upstream-models")
-async def admin_upstream_models(request: Request):
+async def admin_upstream_models(request: Request, provider: str = ""):
     """Probe each backend's real /v1/models concurrently — the 'bypass' button.
 
     Shows every id a backend actually serves, regardless of its enabled_models
@@ -306,7 +331,13 @@ async def admin_upstream_models(request: Request):
         except Exception as e:  # noqa: BLE001 - report per-backend, never 500 the page
             return {"provider": p.name, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    results = await asyncio.gather(*(probe(p) for p in conf.PROVIDERS))
+    # `?provider=name` probes just one backend: the Config tab needs a single
+    # catalog when a provider is expanded, and probing all eight (cloud APIs
+    # included) to fill one checkbox list would take seconds.
+    wanted = [p for p in conf.PROVIDERS if not provider or p.name == provider]
+    if provider and not wanted:
+        return JSONResponse({"error": f"unknown provider '{provider}'"}, status_code=404)
+    results = await asyncio.gather(*(probe(p) for p in wanted))
     return {"providers": results}
 
 
@@ -406,6 +437,208 @@ async def admin_inflight_body(request_id: int, request: Request):
             {"error": f"no captured body for request {request_id}"}, status_code=404
         )
     return {"id": request_id, "limit": conf.INFLIGHT_BODY_LIMIT, **rec}
+
+
+def _config_targets(model_name: str, lm) -> list:
+    """Targets for the config editor, keeping `model` **as written**.
+
+    `_serialize_targets` resolves the native id for display, which is right for
+    the routing view but wrong for an editor: a target that inherits its id from
+    the provider's model_map would come back looking like an explicit pin, and
+    saving the form unchanged would write that pin into the file — silently
+    changing what the config means. So `model` is the raw value (null when
+    inherited) and `resolved_model` is what it currently resolves to, shown as a
+    placeholder.
+    """
+    return [
+        {
+            "provider": t.provider,
+            "model": t.model,
+            "resolved_model": _resolved_native(model_name, t),
+            "priority": t.priority,
+        }
+        for t in lm.targets
+    ]
+
+
+def _config_snapshot() -> dict:
+    """The config as the console edits it. **Never** includes `api_key`: a
+    provider reports only whether one is set (`has_api_key`), preserving the rule
+    that secrets do not leave the process."""
+    return {
+        "path": conf.CONFIG_PATH,
+        "writable": configwrite.config_writable(),
+        "providers": [
+            {
+                "name": p.name,
+                "base_url": p.base_url,
+                "slots": p.slots,
+                "priority": p.priority,
+                "require_permission": p.require_permission,
+                "cache_ttl": p.cache_ttl,
+                "strip_path_prefix": p.strip_path_prefix,
+                "lists_all": p.lists_all,
+                "enabled_models": list(p.enabled_models),
+                "model_map": dict(p.model_map),
+                "has_api_key": bool(p.api_key),
+            }
+            for p in conf.PROVIDERS
+        ],
+        "logical_models": [
+            {"name": name, "targets": _config_targets(name, lm)}
+            for name, lm in conf.LOGICAL_MODELS.items()
+        ],
+        "aliases": dict(conf.ALIASES),
+        "routing": {
+            "queue_timeout": conf.ROUTING.queue_timeout,
+            "failover": conf.ROUTING.failover,
+            "auto_group": conf.ROUTING.auto_group,
+            "down_backoff": conf.ROUTING.down_backoff,
+            "queue_affinity": conf.ROUTING.queue_affinity,
+            "affinity_max_skips": conf.ROUTING.affinity_max_skips,
+        },
+    }
+
+
+async def _persisted(ok: bool, error, what: str):
+    """Shared tail of every config mutation: reload on success, then hand back the
+    fresh snapshot so the console re-renders from the file rather than from what it
+    hoped it wrote."""
+    log = logging.getLogger("llm-proxy")
+    if ok:
+        log.info("Config edit from the console: %s", what)
+        await _apply_config_change()
+    else:
+        log.warning("Config edit refused (%s): %s", what, error)
+    body = _config_snapshot()
+    body["persisted"] = ok
+    body["error"] = error
+    return JSONResponse(body, status_code=200 if ok else 422)
+
+
+def _bad(message: str):
+    return JSONResponse({"error": message}, status_code=422)
+
+
+@app.get("/admin/config")
+async def admin_config(request: Request):
+    """The editable config: providers (no secrets), logical models, aliases,
+    routing. Backs the console's Config tab."""
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    return _config_snapshot()
+
+
+@app.put("/admin/config/providers/{name}/enabled-models")
+async def admin_set_enabled_models(name: str, request: Request):
+    """Set which upstream models a backend may serve.
+
+    An empty list is meaningful, not a no-op: it means "expose everything this
+    backend live-reports" (`Provider.lists_all`), which is how the ollama boxes are
+    configured. So the editor can move a provider in both directions.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    if name not in conf.PROVIDERS_BY_NAME:
+        return JSONResponse({"error": f"unknown provider '{name}'"}, status_code=404)
+    body = await request.json()
+    models = body.get("models")
+    if models is None:
+        models = []
+    if not isinstance(models, list) or any(
+        not isinstance(m, str) or not m.strip() for m in models
+    ):
+        return _bad('body must be {"models": ["native-id", ...]} of non-empty strings')
+    cleaned = list(dict.fromkeys(m.strip() for m in models))
+    ok, error = await configwrite.set_enabled_models(name, cleaned)
+    return await _persisted(ok, error, f"{name}.enabled_models = {len(cleaned)} model(s)")
+
+
+@app.put("/admin/config/aliases")
+async def admin_set_aliases(request: Request):
+    """Replace the alias map. An alias shadows everything else in resolution, so
+    one pointing at an unknown provider would silently break a model name — those
+    are refused rather than written."""
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    body = await request.json()
+    aliases = body.get("aliases")
+    if not isinstance(aliases, dict):
+        return _bad('body must be {"aliases": {"name": "target", ...}}')
+    cleaned = {}
+    for key, value in aliases.items():
+        key, value = str(key).strip(), str(value).strip()
+        if not key or not value:
+            return _bad("alias names and targets must both be non-empty")
+        if conf.PROVIDER_SEP in value:
+            prefix = value.split(conf.PROVIDER_SEP, 1)[0]
+            if prefix not in conf.PROVIDERS_BY_NAME:
+                return _bad(
+                    f"alias '{key}' points at unknown provider '{prefix}' — "
+                    f"use 'provider:model' with a configured provider, or a bare model name"
+                )
+        cleaned[key] = value
+    ok, error = await configwrite.set_aliases(cleaned)
+    return await _persisted(ok, error, f"aliases = {sorted(cleaned)}")
+
+
+@app.put("/admin/config/models/{name}")
+async def admin_set_logical_model(name: str, request: Request):
+    """Create or replace a logical model (a "group"): one client-facing name in
+    front of an ordered list of backend targets."""
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    name = name.strip()
+    if not name:
+        return _bad("model name must not be empty")
+    if name in conf.ALIASES:
+        return _bad(
+            f"'{name}' is already an alias — an alias is resolved first, so the "
+            f"logical model would never be reached. Remove the alias first."
+        )
+    body = await request.json()
+    targets = body.get("targets")
+    if not isinstance(targets, list) or not targets:
+        return _bad('body must be {"targets": [{"provider", "priority", "model"?}, ...]}')
+    cleaned = []
+    for item in targets:
+        if not isinstance(item, dict):
+            return _bad("each target must be an object")
+        provider = str(item.get("provider", "")).strip()
+        if provider not in conf.PROVIDERS_BY_NAME:
+            return _bad(f"unknown provider '{provider}'")
+        try:
+            priority = int(item.get("priority", 100))
+        except (TypeError, ValueError):
+            return _bad(f"target {provider}: priority must be an integer")
+        if priority < 1:
+            return _bad(f"target {provider}: priority must be 1 or greater")
+        native = item.get("model")
+        native = str(native).strip() if native else None
+        cleaned.append({"provider": provider, "priority": priority, "model": native})
+    seen = {(t["provider"], t["model"]) for t in cleaned}
+    if len(seen) != len(cleaned):
+        return _bad("duplicate (provider, model) target in the list")
+    cleaned.sort(key=lambda t: t["priority"])
+    ok, error = await configwrite.set_logical_model(name, cleaned)
+    return await _persisted(ok, error, f"models['{name}'] = {len(cleaned)} target(s)")
+
+
+@app.delete("/admin/config/models/{name}")
+async def admin_delete_logical_model(name: str, request: Request):
+    """Drop a logical model. Its clients fall back to the ordinary resolution
+    order, which for same-named backends is auto-group."""
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    if name not in conf.LOGICAL_MODELS:
+        return JSONResponse({"error": f"unknown logical model '{name}'"}, status_code=404)
+    ok, error = await configwrite.delete_logical_model(name)
+    return await _persisted(ok, error, f"deleted models['{name}']")
 
 
 @app.get("/admin/routing")
