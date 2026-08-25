@@ -640,7 +640,20 @@ async def _dispatch(
                 media_type="application/json",
             )
 
-        provider = conf.PROVIDERS_BY_NAME[target.provider]
+        provider = conf.PROVIDERS_BY_NAME.get(target.provider)
+        if provider is None:
+            # The config hot-reloaded away this provider between resolution and
+            # admission — now genuinely possible, since the console can delete a
+            # backend while a request is queued for it. Give the slot back and
+            # move on rather than raising a KeyError into the client.
+            await slots.release(target.provider, target.model)
+            remaining = [t for t in remaining if t.provider != target.provider]
+            logger.warning(
+                "Provider '%s' disappeared from the config while a request was "
+                "queued for it; %d target(s) left for model '%s'",
+                target.provider, len(remaining), target.model,
+            )
+            continue
         last_provider = provider
         entry.run(target.provider, target.model)
         body, body_str = _build_body(payload, provider, target.model)

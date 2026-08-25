@@ -34,14 +34,23 @@ def _from_logical(raw: str):
     out = []
     for t in lm.targets:
         p = conf.PROVIDERS_BY_NAME.get(t.provider)
-        if t.model is not None:
-            model = t.model
-        elif p:
-            model = p.to_native(lm.name)
-        else:
-            model = lm.name
+        if p is None:
+            # A target naming a provider that isn't configured — a half-finished
+            # config edit (the provider block removed, the target left behind).
+            # It can never be served, and keeping it would hand the dispatcher a
+            # provider it cannot look up. Drop it here; the console flags it as
+            # `known_provider: false` so it stays visible and fixable.
+            logger.warning(
+                "Model '%s' has a target on unknown provider '%s' — skipping it. "
+                "Remove the target, or re-add the provider.",
+                raw, t.provider,
+            )
+            continue
+        model = t.model if t.model is not None else p.to_native(lm.name)
         out.append(conf.Target(t.provider, model, t.priority))
-    return out
+    # Every target dangling: treat the entry as absent so resolution can still
+    # fall through to auto-group rather than dead-ending on a broken block.
+    return out or None
 
 
 async def _auto_group(raw: str):
