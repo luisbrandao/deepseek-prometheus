@@ -561,23 +561,31 @@ Scrape `http://<host>:8000/metrics`:
 > **Metric prefix:** as of the multi-backend rework these use `llm_proxy_` (was
 > `deepseek_proxy_`). Update existing Grafana/alert queries accordingly.
 
-### Persistence across restarts (optional)
+### Counters reset on restart — on purpose
 
-In-memory counters reset to zero on restart, which Prometheus sees as a counter reset and
-loses the delta around the reboot. Enable **`METRICS_PERSIST=true`** to snapshot the
-cumulative counters to `METRICS_PERSIST_PATH` (lazily, every `METRICS_FLUSH_INTERVAL`
-seconds and on graceful shutdown) and re-seed them on boot, keeping totals continuous.
+In-memory counters go back to zero when the proxy restarts. Prometheus recognises that
+as a counter reset and compensates for it, so `rate()` and `increase()` stay correct
+across a reboot; all you lose is the sliver of traffic between the last scrape and the
+shutdown.
 
-Only counters are persisted; live gauges (`slots_in_use`, `queue_waiting`) and the latency
-histogram intentionally reset. **The path must be on a volume that outlives the
-container** (the bundled `docker-compose.yml` mounts `./data`), otherwise the file is
-recreated empty each restart and persistence is a no-op.
+**Do not "fix" this by snapshotting the counters to disk and re-seeding them on boot.**
+This repo shipped exactly that (`METRICS_PERSIST`) and it was removed, because it turns a
+harmless reset into a fabricated spike. The snapshot always lags the last scrape a little,
+so the counter comes back *lower* than the value Prometheus already read. Prometheus reads
+any decrease as a reset-to-zero and credits the **entire pre-drop value** as fresh
+increase — the phantom is the size of the whole counter, not the size of the dip. On
+2026-08-26 a two-request lag reported 1260 requests and 36.6 M input tokens inside a
+21-minute window for a local model that had served two.
 
-| Env var | Default | Description |
-|---|---|---|
-| `METRICS_PERSIST` | `false` | Enable counter persistence |
-| `METRICS_PERSIST_PATH` | `metrics_state.json` | Where the snapshot is written (use a mounted volume) |
-| `METRICS_FLUSH_INTERVAL` | `30` | Seconds between lazy snapshots |
+For long-range totals, use the reset-proof `:increase5m` recording rules
+(`monitoring/recording-rules.yml` in the deploy repo) rather than reading the raw counter:
+
+```promql
+sum_over_time(llm_proxy_requests_total:increase5m[$__range])
+```
+
+Live gauges (`slots_in_use`, `queue_waiting`) and the latency histogram reflect the current
+process and reset too — that is what they are for.
 
 ## Request Logging
 

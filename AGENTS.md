@@ -22,11 +22,10 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
-| `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix) + `PERSISTABLE_COUNTERS`. |
-| `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
+| `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
 | `app/configwrite.py` | Persists console edits into `CONFIG_PATH` via a **ruamel.yaml round-trip** (comments/key order/quoting preserved). `persist_model_priorities`, `set_enabled_models`, `set_aliases`, `set_logical_model`, `delete_logical_model` — each returns `(ok, reason)`. Abort-don't-corrupt; in-place write (bind-mount inode). |
-| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump + the config hot-reload watcher). Also the `/admin/*` API + `/ui` static mount that back the web console. |
+| `app/main.py` | FastAPI app, routes, logging unification, lifespan (the config hot-reload watcher). Also the `/admin/*` API + `/ui` static mount that back the web console. |
 | `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
 ## Request lifecycle (`proxy.proxy_request`)
@@ -178,10 +177,14 @@ decompresses the response. Single process, async, one uvicorn worker.
   the request task waits on client disconnect, so cancelling the latter mid-stream unwinds
   through Starlette's disconnect listener and uvicorn logs a spurious "Exception in ASGI
   application" traceback for a deliberate action.
-- **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
-  cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
-  or the histogram. Persistence must never crash startup or a request — failures are logged
-  and swallowed.
+- **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
+- **Never persist or re-seed the counters.** A restart resetting them to zero is a real
+  counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
+  disk does not: it always lags the last scrape, so the counter returns *lower* than what
+  Prometheus already read, and Prometheus credits the whole pre-drop value as new increase.
+  The phantom equals the entire counter, however small the dip. `METRICS_PERSIST` did this
+  and was removed; don't reintroduce it. Long-range totals belong in a recording rule
+  (`sum_over_time(<counter>:increase5m[range])`), not in the process.
 
 ## Conventions
 

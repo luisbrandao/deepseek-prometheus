@@ -149,10 +149,11 @@ Expect the new `master-N` in the image column, a `Up …` status, and
 tabs render — the static console ships inside the image, so a stale tag is
 obvious there.
 
-Note that cumulative metrics survive the restart (`METRICS_PERSIST=true`, snapshot
-in the `llmproxy-data` volume), but slot/queue/health state and the log ring
-buffer are in-process and reset. In-flight requests are dropped on recreate — a
-restart mid-generation cuts those clients off.
+Note that metric counters reset on restart, along with slot/queue/health state
+and the log ring buffer — all of it is in-process. That reset is fine:
+Prometheus compensates for it in `rate()`/`increase()`, and long-range totals
+come from the `:increase5m` recording rules. In-flight requests are dropped on
+recreate — a restart mid-generation cuts those clients off.
 
 ## Rollback
 

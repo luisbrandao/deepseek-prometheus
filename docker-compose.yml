@@ -12,14 +12,9 @@ services:
       - LOG_OUTPUT=false
       - PORT=8000
       - PROXY_API_KEYS=sk-1234
-      # Persist cumulative metric counters across restarts (optional).
-      - METRICS_PERSIST=true
-      - METRICS_PERSIST_PATH=/app/data/metrics_state.json
-      - METRICS_FLUSH_INTERVAL=30
     volumes:
       # rw so runtime routing edits from the web console persist into the file.
       - ./config.yaml:/app/config.yaml
-      - ./data:/app/data            # holds metrics_state.json across restarts
     ports:
       - "9999:8000"
     restart: unless-stopped

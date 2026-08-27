@@ -312,10 +312,3 @@ INFLIGHT_BODIES = _flag("INFLIGHT_BODIES", "true")
 # Per-side cap in bytes. A 170 KiB prompt is ordinary for an agentic client, so
 # bodies are truncated head-first rather than stored whole.
 INFLIGHT_BODY_LIMIT = int(os.environ.get("INFLIGHT_BODY_LIMIT", "16384"))
-
-# Optional metric persistence: snapshot cumulative counters to disk and restore
-# them on boot so Prometheus deltas stay continuous across restarts. The path
-# must live on a volume that survives pod recreation to be useful.
-METRICS_PERSIST = _flag("METRICS_PERSIST", "false")
-METRICS_PERSIST_PATH = os.environ.get("METRICS_PERSIST_PATH", "metrics_state.json")
-METRICS_FLUSH_INTERVAL = int(os.environ.get("METRICS_FLUSH_INTERVAL", "30"))

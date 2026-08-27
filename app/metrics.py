@@ -63,18 +63,15 @@ FAILOVERS_TOTAL = Counter(
     ["provider"],
 )
 
-# Counters whose cumulative values survive restarts, keyed by their emitted
-# sample name. Gauges (live state) and the latency histogram are intentionally
-# not persisted — they reflect the current process, not a running total.
-PERSISTABLE_COUNTERS = {
-    "llm_proxy_requests_total": REQUESTS_TOTAL,
-    "llm_proxy_tokens_input_total": TOKENS_INPUT_TOTAL,
-    "llm_proxy_tokens_output_total": TOKENS_OUTPUT_TOTAL,
-    "llm_proxy_errors_total": ERRORS_TOTAL,
-    "llm_proxy_failovers_total": FAILOVERS_TOTAL,
-    "llm_proxy_queue_affinity_grants_total": QUEUE_AFFINITY_GRANTS,
-    "llm_proxy_queue_starvation_yields_total": QUEUE_STARVATION_YIELDS,
-}
+# NOTE: these counters are deliberately NOT persisted across restarts. A restart
+# resets them to zero, which Prometheus recognises as a counter reset and handles
+# correctly in rate()/increase(). Re-seeding them from a snapshot is what breaks
+# that: the file always lags the last scrape a little, so the counter comes back
+# *lower* than the value Prometheus already read. Prometheus reads any decrease
+# as a reset-to-zero and credits the entire pre-drop value as fresh increase — a
+# two-request lag once turned into a phantom 1190-request, 36M-token spike inside
+# a 21-minute window. For lifetime totals use the `:increase5m` recording rules,
+# which are reset-proof, instead of reading the raw counter.
 
 
 def metrics_response():
