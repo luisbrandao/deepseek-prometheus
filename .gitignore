@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
 config.yaml
 
-# Persisted metric state (lives on a mounted volume in production)
+# Leftovers from the removed METRICS_PERSIST feature. Counters are deliberately
+# never persisted (see AGENTS.md); these stay ignored only so an old deploy's
+# files don't show up as untracked.
 data/
 metrics_state.json
 

@@ -11,7 +11,29 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Gates the build below. The suite needs no network and runs in under a second,
+  # so there is no reason to publish an image that fails it.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # match the Dockerfile
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Import check against the example config
+        run: CONFIG_PATH=config.example.yaml python -c "from app import main; print('imports OK')"
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

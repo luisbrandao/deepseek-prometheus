@@ -6,17 +6,23 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, logbuffer, registry, slots
+from app import auth, configwrite, inflight, logbuffer, registry, slots, upstream
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+
+# One module-level logger, as in every other module here. It was previously
+# fetched inline at each call site — including once as getLogger(__name__), which
+# put that single line on the `app.main` logger while the rest of the process logs
+# under `llm-proxy`, so the console's logger column disagreed with itself.
+logger = logging.getLogger("llm-proxy")
 
 
 class _LocalTimeFormatter(logging.Formatter):
@@ -123,16 +129,15 @@ async def _apply_config_change() -> bool:
     effects as the watcher: drop the discovery cache (allow-lists may have moved)
     and wake slot waiters (capacity may have).
     """
-    log = logging.getLogger("llm-proxy")
     try:
         if not conf.reload_if_changed():
             return False
     except Exception as e:  # noqa: BLE001 - a write we validated should parse, but
-        log.warning("Config written but reload failed: %s: %s", type(e).__name__, e)
+        logger.warning("Config written but reload failed: %s: %s", type(e).__name__, e)
         return False
     registry.clear_cache()
     await slots.poke()
-    log.info(
+    logger.info(
         "Config reloaded after a console edit: %d providers, %d logical models, %d aliases",
         len(conf.PROVIDERS), len(conf.LOGICAL_MODELS), len(conf.ALIASES),
     )
@@ -153,14 +158,13 @@ async def _config_reload_loop():
     The console's own routing edits (configwrite) also land here one tick
     later; that reload is a no-op state-wise since memory already matches.
     """
-    log = logging.getLogger("llm-proxy")
     while True:
         await asyncio.sleep(conf.CONFIG_RELOAD_INTERVAL)
         try:
             if conf.reload_if_changed():
                 registry.clear_cache()
                 await slots.poke()
-                log.info(
+                logger.info(
                     "Config reloaded from %s: %d providers, %d logical models, %d aliases",
                     conf.CONFIG_PATH,
                     len(conf.PROVIDERS),
@@ -172,7 +176,7 @@ async def _config_reload_loop():
             # next tick sees the settled result. Keep the running config.
             pass
         except Exception as e:  # noqa: BLE001 - a bad edit must never kill the app
-            log.warning(
+            logger.warning(
                 "Config reload failed — keeping the running config: %s: %s",
                 type(e).__name__,
                 e,
@@ -193,6 +197,8 @@ async def lifespan(app: FastAPI):
     finally:
         if reload_task is not None:
             reload_task.cancel()
+        # Close the shared upstream connection pools (see app/upstream.py).
+        await upstream.aclose()
 
 
 app = FastAPI(title="LLM Proxy", lifespan=lifespan)
@@ -232,7 +238,7 @@ async def set_logging(request: Request):
                     {"error": f"{key} must be a boolean"}, status_code=422
                 )
             setattr(conf, attr, value)
-    logging.getLogger(__name__).info(
+    logger.info(
         "Logging flags updated: LOG_INPUT=%s LOG_OUTPUT=%s",
         conf.LOG_INPUT,
         conf.LOG_OUTPUT,
@@ -253,11 +259,36 @@ async def models(request: Request):
 # serialization deliberately omits api_key — secrets never leave the process.
 
 
-def _admin_gate(request: Request):
-    """Return a 403 JSONResponse if the caller isn't authorized, else None."""
+class _AdminForbidden(HTTPException):
+    """403 for the admin gate, with a dedicated handler below.
+
+    A plain HTTPException would render `{"detail": ...}`; this keeps the
+    `{"error": "unauthorized"}` body the endpoints returned before the gate moved
+    into a dependency, so anything scripting /admin/* sees no change.
+    """
+
+    def __init__(self):
+        super().__init__(status_code=403, detail="unauthorized")
+
+
+def require_admin(request: Request) -> None:
+    """Dependency enforcing the admin bearer gate. Raises 403 when it fails.
+
+    A dependency rather than a helper each handler remembers to call: the gate is
+    load-bearing (the log buffer can hold full prompt and response bodies once
+    LOG_INPUT/LOG_OUTPUT are on), and the old two-line prologue failed silently —
+    a new endpoint that omitted it was simply unprotected, with nothing to catch
+    it. Attached to `admin` below, so every route on that router inherits it and
+    the invariant is structural instead of remembered.
+    """
     if not auth.is_authorized(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=403)
-    return None
+        raise _AdminForbidden()
+
+
+# Every /admin/* route lives on this router, so the gate above applies to all of
+# them by construction. Mounted on the app after the routes are declared, and
+# still above the catch-all proxy route.
+admin = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
 def _levelno(name: str) -> int:
@@ -265,31 +296,78 @@ def _levelno(name: str) -> int:
     return value if isinstance(value, int) else logging.INFO
 
 
-def _resolved_native(model_name: str, target) -> str:
-    """The native wire id a logical target uses: its explicit `model`, else the
-    canonical name reverse-mapped through the provider's model_map (mirrors
-    router._from_logical). Stable identity for matching a UI reorder to a target.
+def _provider_view(p, *, live=False, editable=False, fronted=None) -> dict:
+    """One provider, serialized for an admin view. **Never** includes `api_key`.
+
+    Three views used to hand-write overlapping dicts of these fields, which meant
+    adding a `Provider` field needed edits in up to three places and the field
+    sets had already drifted apart for no reason. They nest cleanly, so this is
+    one function with two switches:
+
+    * `live` adds the runtime state the in-flight and routing views need
+      (occupancy, health, resident model) — read from `slots`/`registry`, not the
+      config.
+    * `editable` adds the settings the Config tab edits, including `has_api_key`
+      in place of the key itself, so the secret stays in-process.
     """
-    p = conf.PROVIDERS_BY_NAME.get(target.provider)
-    if target.model is not None:
-        return target.model
-    return p.to_native(model_name) if p else model_name
+    out = {
+        "name": p.name,
+        "base_url": p.base_url,
+        "slots": p.slots,
+        "priority": p.priority,
+        "require_permission": p.require_permission,
+        "lists_all": p.lists_all,
+    }
+    if live:
+        out.update({
+            "in_use": slots.in_use(p.name),
+            "is_down": registry.is_down(p.name),
+            # What this backend most recently ran, i.e. what it is expected to
+            # still have loaded — the basis of the queue's affinity decision.
+            "resident": slots.resident_model(p.name),
+        })
+    if editable:
+        out.update({
+            "cache_ttl": p.cache_ttl,
+            "strip_path_prefix": p.strip_path_prefix,
+            "enabled_models": list(p.enabled_models),
+            "model_map": dict(p.model_map),
+            "fronted": (fronted or {}).get(p.name, {}),
+            "has_api_key": bool(p.api_key),
+        })
+    return out
 
 
-def _serialize_targets(model_name: str, lm) -> list:
-    return [
-        {
+def _serialize_targets(model_name: str, lm, raw: bool = False) -> list:
+    """A logical model's targets, for either the routing view or the editor.
+
+    The two differ in exactly one thing, and it matters: `raw=False` reports
+    `model` already resolved, which is the stable identity the routing view
+    matches a reorder against. `raw=True` reports `model` **as written** (null
+    when inherited) plus a separate `resolved_model`, because an editor that got
+    the resolved id back would write it into the file on the next save — silently
+    turning every inherited target into an explicit pin and changing what the
+    config means without changing what it says.
+    """
+    out = []
+    for t in lm.targets:
+        resolved = conf.native_for(model_name, t.provider, t.model)
+        row = {
             "provider": t.provider,
-            "model": _resolved_native(model_name, t),
             "priority": t.priority,
             "is_down": registry.is_down(t.provider),
             "known_provider": t.provider in conf.PROVIDERS_BY_NAME,
         }
-        for t in lm.targets
-    ]
+        if raw:
+            row["model"] = t.model
+            row["resolved_model"] = resolved
+        else:
+            row["model"] = resolved
+        out.append(row)
+    return out
 
 
-@app.get("/admin/logs")
+@admin.get("/logs")
 async def admin_logs(request: Request, since: int = 0, level: str = "DEBUG"):
     """Recent log lines with seq > `since` (the UI's live-tail cursor).
 
@@ -297,9 +375,6 @@ async def admin_logs(request: Request, since: int = 0, level: str = "DEBUG"):
     by `level` — so the cursor advances past filtered lines instead of re-pulling
     them on every poll.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     new = logbuffer.handler.entries(since)
     last_seq = new[-1]["seq"] if new else since
     threshold = _levelno((level or "DEBUG").upper())
@@ -308,16 +383,13 @@ async def admin_logs(request: Request, since: int = 0, level: str = "DEBUG"):
     return {"entries": new, "last_seq": last_seq}
 
 
-@app.get("/admin/upstream-models")
+@admin.get("/upstream-models")
 async def admin_upstream_models(request: Request, provider: str = ""):
     """Probe each backend's real /v1/models concurrently — the 'bypass' button.
 
     Shows every id a backend actually serves, regardless of its enabled_models
     allow-list, so each endpoint's full catalog is visible in one place.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
 
     async def probe(p):
         try:
@@ -336,7 +408,7 @@ async def admin_upstream_models(request: Request, provider: str = ""):
     return {"providers": results}
 
 
-@app.get("/admin/inflight")
+@admin.get("/inflight")
 async def admin_inflight(request: Request):
     """Everything currently in flight: requests holding a slot and requests
     queued behind one, arrival-ordered, plus each provider's slot occupancy.
@@ -346,29 +418,15 @@ async def admin_inflight(request: Request):
     slot accounting the Routing tab shows, repeated here so the queue and the
     capacity that gates it read side by side.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     snap = inflight.snapshot()
-    snap["providers"] = [
-        {
-            "name": p.name,
-            "slots": p.slots,
-            "in_use": slots.in_use(p.name),
-            "is_down": registry.is_down(p.name),
-            # What this backend most recently ran, i.e. what it is expected to
-            # still have loaded — the basis of the queue's affinity decision.
-            "resident": slots.resident_model(p.name),
-        }
-        for p in conf.PROVIDERS
-    ]
+    snap["providers"] = [_provider_view(p, live=True) for p in conf.PROVIDERS]
     snap["queue_timeout"] = conf.ROUTING.queue_timeout
     snap["queue_affinity"] = conf.ROUTING.queue_affinity
     snap["affinity_max_skips"] = conf.ROUTING.affinity_max_skips
     return snap
 
 
-@app.post("/admin/inflight/{request_id}/cancel")
+@admin.post("/inflight/{request_id}/cancel")
 async def admin_cancel_inflight(request_id: int, request: Request):
     """Kill one in-flight request — the console's per-row Kill button.
 
@@ -385,16 +443,13 @@ async def admin_cancel_inflight(request_id: int, request: Request):
     *and* because the killed request may lose its own `event=request` line: the
     cancellation can interrupt the background task that emits it.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     entry = inflight.get(request_id)
     if entry is None:
         return JSONResponse(
             {"error": f"no in-flight request with id {request_id} — it already finished"},
             status_code=404,
         )
-    logging.getLogger("llm-proxy").warning(
+    logger.warning(
         "Cancelling in-flight request #%d: %s (%s) on %s, %s for %.1fs — operator action",
         entry.id,
         entry.model or entry.path,
@@ -407,7 +462,7 @@ async def admin_cancel_inflight(request_id: int, request: Request):
     return {"id": entry.id, "status": "cancelled", "state": entry.state}
 
 
-@app.get("/admin/inflight/{request_id}/body")
+@admin.get("/inflight/{request_id}/body")
 async def admin_inflight_body(request_id: int, request: Request):
     """The prompt and reply captured for one row of the feed.
 
@@ -419,9 +474,6 @@ async def admin_inflight_body(request_id: int, request: Request):
     (`INFLIGHT_BODIES=false`), the row aged out of the history, or the request
     carried no body at all.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     if not conf.INFLIGHT_BODIES:
         return JSONResponse(
             {"error": "body capture is disabled (INFLIGHT_BODIES=false)"}, status_code=404
@@ -434,26 +486,6 @@ async def admin_inflight_body(request_id: int, request: Request):
     return {"id": request_id, "limit": conf.INFLIGHT_BODY_LIMIT, **rec}
 
 
-def _config_targets(model_name: str, lm) -> list:
-    """Targets for the config editor, keeping `model` **as written**.
-
-    `_serialize_targets` resolves the native id for display, which is right for
-    the routing view but wrong for an editor: a target that inherits its id from
-    the provider's model_map would come back looking like an explicit pin, and
-    saving the form unchanged would write that pin into the file — silently
-    changing what the config means. So `model` is the raw value (null when
-    inherited) and `resolved_model` is what it currently resolves to, shown as a
-    placeholder.
-    """
-    return [
-        {
-            "provider": t.provider,
-            "model": t.model,
-            "resolved_model": _resolved_native(model_name, t),
-            "priority": t.priority,
-        }
-        for t in lm.targets
-    ]
 
 
 def _fronted_natives() -> dict:
@@ -465,12 +497,14 @@ def _fronted_natives() -> dict:
     id means clients use the group's name and the raw id is hidden from
     `/v1/models` (see `registry.list_models`), so showing the id alone is
     misleading. Computed here rather than in the browser because
-    `_resolved_native` already knows how an inherited target resolves.
+    `conf.native_for` already knows how an inherited target resolves.
     """
     out = {}
     for name, lm in conf.LOGICAL_MODELS.items():
         for t in lm.targets:
-            out.setdefault(t.provider, {}).setdefault(_resolved_native(name, t), name)
+            out.setdefault(t.provider, {}).setdefault(
+                conf.native_for(name, t.provider, t.model), name
+            )
     return out
 
 
@@ -483,24 +517,10 @@ def _config_snapshot() -> dict:
         "path": conf.CONFIG_PATH,
         "writable": configwrite.config_writable(),
         "providers": [
-            {
-                "name": p.name,
-                "base_url": p.base_url,
-                "slots": p.slots,
-                "priority": p.priority,
-                "require_permission": p.require_permission,
-                "cache_ttl": p.cache_ttl,
-                "strip_path_prefix": p.strip_path_prefix,
-                "lists_all": p.lists_all,
-                "enabled_models": list(p.enabled_models),
-                "model_map": dict(p.model_map),
-                "fronted": fronted.get(p.name, {}),
-                "has_api_key": bool(p.api_key),
-            }
-            for p in conf.PROVIDERS
+            _provider_view(p, editable=True, fronted=fronted) for p in conf.PROVIDERS
         ],
         "logical_models": [
-            {"name": name, "targets": _config_targets(name, lm)}
+            {"name": name, "targets": _serialize_targets(name, lm, raw=True)}
             for name, lm in conf.LOGICAL_MODELS.items()
         ],
         "aliases": dict(conf.ALIASES),
@@ -519,12 +539,11 @@ async def _persisted(ok: bool, error, what: str):
     """Shared tail of every config mutation: reload on success, then hand back the
     fresh snapshot so the console re-renders from the file rather than from what it
     hoped it wrote."""
-    log = logging.getLogger("llm-proxy")
     if ok:
-        log.info("Config edit from the console: %s", what)
+        logger.info("Config edit from the console: %s", what)
         await _apply_config_change()
     else:
-        log.warning("Config edit refused (%s): %s", what, error)
+        logger.warning("Config edit refused (%s): %s", what, error)
     body = _config_snapshot()
     body["persisted"] = ok
     body["error"] = error
@@ -535,17 +554,14 @@ def _bad(message: str):
     return JSONResponse({"error": message}, status_code=422)
 
 
-@app.get("/admin/config")
+@admin.get("/config")
 async def admin_config(request: Request):
     """The editable config: providers (no secrets), logical models, aliases,
     routing. Backs the console's Config tab."""
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     return _config_snapshot()
 
 
-@app.put("/admin/config/providers/{name}/enabled-models")
+@admin.put("/config/providers/{name}/enabled-models")
 async def admin_set_enabled_models(name: str, request: Request):
     """Set which upstream models a backend may serve.
 
@@ -553,9 +569,6 @@ async def admin_set_enabled_models(name: str, request: Request):
     backend live-reports" (`Provider.lists_all`), which is how the ollama boxes are
     configured. So the editor can move a provider in both directions.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     if name not in conf.PROVIDERS_BY_NAME:
         return JSONResponse({"error": f"unknown provider '{name}'"}, status_code=404)
     body = await request.json()
@@ -571,7 +584,7 @@ async def admin_set_enabled_models(name: str, request: Request):
     return await _persisted(ok, error, f"{name}.enabled_models = {len(cleaned)} model(s)")
 
 
-@app.put("/admin/config/providers/{name}/model-map")
+@admin.put("/config/providers/{name}/model-map")
 async def admin_set_model_map(name: str, request: Request):
     """Rename a backend's native ids for clients: `{"model_map": {native: canonical}}`.
 
@@ -581,9 +594,6 @@ async def admin_set_model_map(name: str, request: Request):
     canonical name (verified: the last one wins). That is refused here rather than
     written, with the advice that the multi-backend case wants a group instead.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     if name not in conf.PROVIDERS_BY_NAME:
         return JSONResponse({"error": f"unknown provider '{name}'"}, status_code=404)
     body = await request.json()
@@ -616,14 +626,11 @@ async def admin_set_model_map(name: str, request: Request):
     return await _persisted(ok, error, f"{name}.model_map = {len(cleaned)} mapping(s)")
 
 
-@app.put("/admin/config/aliases")
+@admin.put("/config/aliases")
 async def admin_set_aliases(request: Request):
     """Replace the alias map. An alias shadows everything else in resolution, so
     one pointing at an unknown provider would silently break a model name — those
     are refused rather than written."""
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     body = await request.json()
     aliases = body.get("aliases")
     if not isinstance(aliases, dict):
@@ -645,13 +652,10 @@ async def admin_set_aliases(request: Request):
     return await _persisted(ok, error, f"aliases = {sorted(cleaned)}")
 
 
-@app.put("/admin/config/models/{name}")
+@admin.put("/config/models/{name}")
 async def admin_set_logical_model(name: str, request: Request):
     """Create or replace a logical model (a "group"): one client-facing name in
     front of an ordered list of backend targets."""
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     name = name.strip()
     if not name:
         return _bad("model name must not be empty")
@@ -688,39 +692,21 @@ async def admin_set_logical_model(name: str, request: Request):
     return await _persisted(ok, error, f"models['{name}'] = {len(cleaned)} target(s)")
 
 
-@app.delete("/admin/config/models/{name}")
+@admin.delete("/config/models/{name}")
 async def admin_delete_logical_model(name: str, request: Request):
     """Drop a logical model. Its clients fall back to the ordinary resolution
     order, which for same-named backends is auto-group."""
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     if name not in conf.LOGICAL_MODELS:
         return JSONResponse({"error": f"unknown logical model '{name}'"}, status_code=404)
     ok, error = await configwrite.delete_logical_model(name)
     return await _persisted(ok, error, f"deleted models['{name}']")
 
 
-@app.get("/admin/routing")
+@admin.get("/routing")
 async def admin_routing(request: Request):
     """The routing graph: providers (with live slot/health state), explicit
     logical models and their prioritized targets, and aliases. No api_key."""
-    denied = _admin_gate(request)
-    if denied:
-        return denied
-    providers = [
-        {
-            "name": p.name,
-            "base_url": p.base_url,
-            "slots": p.slots,
-            "in_use": slots.in_use(p.name),
-            "is_down": registry.is_down(p.name),
-            "require_permission": p.require_permission,
-            "lists_all": p.lists_all,
-            "priority": p.priority,
-        }
-        for p in conf.PROVIDERS
-    ]
+    providers = [_provider_view(p, live=True) for p in conf.PROVIDERS]
     logical_models = [
         {"name": name, "editable": True, "targets": _serialize_targets(name, lm)}
         for name, lm in conf.LOGICAL_MODELS.items()
@@ -734,7 +720,7 @@ async def admin_routing(request: Request):
     }
 
 
-@app.post("/admin/routing/{model}")
+@admin.post("/routing/{model}")
 async def admin_set_routing(model: str, request: Request):
     """Rearrange a logical model's target priorities: applied live, then persisted
     into the config file (surgical priority-only rewrite; see app/configwrite.py).
@@ -745,9 +731,6 @@ async def admin_set_routing(model: str, request: Request):
     on a read-only mount (or unrecognized config format) the live change stands
     and the response says `persisted: false` with the reason.
     """
-    denied = _admin_gate(request)
-    if denied:
-        return denied
     lm = conf.LOGICAL_MODELS.get(model)
     if lm is None:
         return JSONResponse({"error": f"unknown logical model '{model}'"}, status_code=404)
@@ -767,7 +750,9 @@ async def admin_set_routing(model: str, request: Request):
             status_code=422,
         )
 
-    existing = {(t.provider, _resolved_native(model, t)): t for t in lm.targets}
+    existing = {
+        (t.provider, conf.native_for(model, t.provider, t.model)): t for t in lm.targets
+    }
     if set(wanted) != set(existing):
         return JSONResponse(
             {"error": "targets must match the model's existing (provider, model) set exactly — reorder only, no add/remove"},
@@ -777,7 +762,7 @@ async def admin_set_routing(model: str, request: Request):
     for key, target in existing.items():
         target.priority = wanted[key]
     lm.targets.sort(key=lambda t: t.priority)
-    logging.getLogger("llm-proxy").info(
+    logger.info(
         "Routing priorities updated for '%s': %s",
         model,
         ", ".join(f"{t.provider}={t.priority}" for t in lm.targets),
@@ -785,7 +770,7 @@ async def admin_set_routing(model: str, request: Request):
 
     persisted, persist_error = await configwrite.persist_model_priorities(model, lm.targets)
     if not persisted:
-        logging.getLogger("llm-proxy").warning(
+        logger.warning(
             "Routing change for '%s' applied live but NOT persisted: %s", model, persist_error
         )
     return {
@@ -795,6 +780,17 @@ async def admin_set_routing(model: str, request: Request):
         "persisted": persisted,
         "persist_error": persist_error,
     }
+
+
+@app.exception_handler(_AdminForbidden)
+async def _admin_forbidden_handler(request: Request, exc: _AdminForbidden):
+    return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+
+# Every /admin/* route is declared on `admin` above, which carries the auth
+# dependency. Included here — after the declarations, and still above the
+# catch-all proxy route so /admin/* wins over the proxy path.
+app.include_router(admin)
 
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -835,7 +831,7 @@ async def _ui_redirect():
 # html=True serves index.html at /ui/. Lives under app/static (already COPYd in).
 app.mount(
     "/ui",
-    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True),
+    StaticFiles(directory=_STATIC_DIR, html=True),
     name="ui",
 )
 

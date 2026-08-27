@@ -2,16 +2,10 @@ import asyncio
 import logging
 import time
 
-import httpx
-
 from app import config as conf
+from app import upstream
 
 logger = logging.getLogger("llm-proxy")
-
-# Probe timeout for live model discovery. Kept short so a powered-off or
-# otherwise unreachable backend fails fast instead of blocking the listing for
-# the duration of a long default timeout.
-PROBE_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 
 # provider name -> (expires_at_epoch, [model_id, ...])
 _cache = {}
@@ -90,10 +84,12 @@ async def _fetch_live(provider: conf.Provider):
     headers = {}
     if provider.api_key:
         headers["authorization"] = f"Bearer {provider.api_key}"
-    async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    # Shared client (see app/upstream.py): probes reuse connections and carry
+    # the short probe timeout, so a powered-off backend fails fast instead of
+    # blocking the listing.
+    resp = await upstream.probe_client().get(url, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
     return [m["id"] for m in data.get("data", []) if m.get("id")]
 
 

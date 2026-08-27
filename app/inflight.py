@@ -2,10 +2,10 @@
 
 The Routing tab already answers *how many* slots each provider has in use; this
 answers the next question: **which** requests those are, and what is stacked up
-behind them. `slots.py` keeps only a per-provider counter, and its queue lives
-inside an `asyncio.Condition` whose waiters are opaque from the outside — so a
-request stuck waiting for capacity is invisible. Registering every proxied
-request on arrival makes both sets enumerable.
+behind them. `slots.py` keeps only a per-provider counter and a list of `_Waiter`
+objects holding bare futures — nothing in there records what a waiting request
+*is*, so a request stuck waiting for capacity is invisible from the outside.
+Registering every proxied request on arrival makes both sets enumerable.
 
 A finished request is not dropped: it is frozen and moved to the front of a
 `_recent` ring buffer, so the console shows a rolling feed (newest first) rather
@@ -224,9 +224,9 @@ class Entry:
         """Kill this request by cancelling the task serving it.
 
         Cancellation, not a polled flag, because the interesting cases are all
-        blocked inside somebody else's `await`: a queued request sits in
-        `slots.acquire`'s Condition, and a running one sits in an httpx read that
-        may never return — which is exactly the request worth killing, and exactly
+        blocked inside somebody else's `await`: a queued request sits on its
+        `slots._Waiter` future, and a running one sits in an httpx read that may
+        never return — which is exactly the request worth killing, and exactly
         the one a flag nobody gets to check could never stop. CancelledError is
         delivered to that await and unwinds the normal cleanup path: slot
         released, upstream connection closed, entry moved into the history.

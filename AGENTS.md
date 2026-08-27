@@ -16,16 +16,18 @@ decompresses the response. Single process, async, one uvicorn worker.
 | File | Responsibility |
 |---|---|
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
-| `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → allow-listed provider. Returns `[]` when nothing serves the model — **never** a guessed backend. |
+| `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group. `_allow_listed` is the fallback for `auto_group: false` only — with auto-grouping on it can match nothing `_auto_group` doesn't. Returns `[]` when nothing serves the model — **never** a guessed backend. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout, on_skip)` / `release(provider, model)` / `poke()`. Priority admission (round-robin within a tie tier), then an **explicit** queue of `_Waiter` futures with model-affinity reordering. Also `in_use`/`resident_model`/`queue_depth` for introspection. |
 | `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/token/record`, `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, `Entry.cancel()` for the Kill button, and a separate bounded `_bodies` store (`set_request`/`add_response`/`bodies()`) read only by `/admin/inflight/{id}/body`. Observation only apart from `cancel` — nothing in the *request path* reads it. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
-| `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
+| `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
+| `app/upstream.py` | The two shared `httpx.AsyncClient`s and their timeouts. Everything outbound goes through here so connections are pooled; `FORWARD_TIMEOUT` is long-read/short-connect on purpose. Closed by `main`'s lifespan. |
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
 | `app/configwrite.py` | Persists console edits into `CONFIG_PATH` via a **ruamel.yaml round-trip** (comments/key order/quoting preserved). `persist_model_priorities`, `set_enabled_models`, `set_aliases`, `set_logical_model`, `delete_logical_model` — each returns `(ok, reason)`. Abort-don't-corrupt; in-place write (bind-mount inode). |
-| `app/main.py` | FastAPI app, routes, logging unification, lifespan (the config hot-reload watcher). Also the `/admin/*` API + `/ui` static mount that back the web console. |
+| `app/main.py` | FastAPI app, routes, logging unification, lifespan (config hot-reload watcher + upstream pool shutdown). The `/admin/*` API lives on the `admin` `APIRouter`, which carries the auth dependency, plus the `/ui` static mount. `_provider_view` / `_serialize_targets` are the single serializers all three admin views share. |
+| `tests/` | pytest + pytest-asyncio. `pip install -r requirements-dev.txt && pytest`. See **Testing** below for what each file guards. |
 | `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
 ## Request lifecycle (`proxy.proxy_request`)
@@ -37,6 +39,45 @@ decompresses the response. Single process, async, one uvicorn worker.
 5. Drop currently-down targets (keep as last resort).
 6. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
 
+## Layering
+
+Strict topological order — nothing imports upward, nothing imports sideways
+within a layer, so there are no cycles:
+
+```
+main.py                        ASGI entry: routes, /admin router, lifespan
+  └─ proxy.py                  request lifecycle, failover
+       └─ router.py            name -> ordered targets
+            └─ registry.py     discovery + health
+  registry · slots · inflight · auth · clientinfo · configwrite     services
+       └─ config.py            the leaf everything reads
+  config.py · metrics.py · logbuffer.py · upstream.py               leaves
+```
+
+`config.py` is the only module everything depends on, and it is read **per
+operation** (`conf.X`) rather than snapshotted at import. That is the whole
+mechanism behind hot reload: `reload_if_changed()` rebinds the module globals,
+and because there is no `await` between the rebinds, a request sees either the
+old config or the new one, never a mix.
+
+## Where state lives
+
+Every piece of state that gates admission is a plain dict in one process's
+memory. That is not an oversight — it is what makes the slot handoff correct
+without a lock — but it is why the single uvicorn worker is load-bearing, and why
+a restart is a real reset rather than an inconvenience. Three tiers, and the
+difference between them is deliberate:
+
+| Tier | What | Why |
+|---|---|---|
+| **Dropped on every config reload** | `registry._cache`, `registry._last_good` | A changed `base_url` points somewhere else entirely, so a catalog from the previous endpoint is worse than no catalog. |
+| **Survives a reload, lost on restart** | `slots._in_use` / `_running` / `_last_model` / `_waiters`, `registry._down_until`, `inflight._active` / `_recent` / `_bodies`, `logbuffer._buf`, the Prometheus counters | Keyed by provider *name*, so it survives the rebind on purpose: a request holding a slot still holds it after the edit. |
+| **Durable, outside the process** | `config.yaml` (ruamel round-trip, in place), Loki (one `event=request` line per request), Prometheus (scraped counters) | The durable copy of every request is its log line, which is exactly why the in-memory history is allowed to be lossy. |
+
+Most of the invariants below are consequences of that table rather than
+independent rules. If you add process-local state, add it to the reset list in
+`tests/conftest.py` too, or it leaks between tests.
+
 ## Invariants — do not break these
 
 - **Single worker.** Slot/queue/health state is in-process. Never add `--workers > 1`
@@ -47,7 +88,7 @@ decompresses the response. Single process, async, one uvicorn worker.
   never cache config values across requests. `reload_if_changed()` rebinds the module
   globals with no `await` in between, so a request sees either the old or the new
   config, never a mix. After a reload the watcher drops `registry._cache` and pokes
-  the slot Condition; derived state keyed by provider *name* (`slots._in_use`,
+  queued slot waiters; derived state keyed by provider *name* (`slots._in_use`,
   `registry._down_until`) intentionally survives.
 - **Every acquired slot must be released exactly once.** Non-stream: released in
   `_dispatch` after the call. Stream: released in the generator's `finally` via the
@@ -82,9 +123,14 @@ decompresses the response. Single process, async, one uvicorn worker.
   failover triggers — the `RequestError` except-branch and the `_should_failover(status)`
   check on the returned response — and is the only place that converts errors to terminal
   client responses (`_backend_error`, 401, 503) or relays an upstream error verbatim.
-- **Decompression reads raw bytes.** `_handle_non_stream` uses `aiter_raw()` + manual
-  `_decompress` because httpx can't decode brotli without the lib. The forwarded
-  `Accept-Encoding` is capped to `gzip, deflate` in `_build_headers`. Keep these aligned.
+- **Decompression reads raw bytes, and handles exactly what it advertises.**
+  `_handle_non_stream` uses `aiter_raw()` + manual `_decompress` so we control decoding.
+  `_build_headers` caps the forwarded `Accept-Encoding` at `gzip, deflate` and
+  `_decompress` implements exactly those two — **keep them aligned**. The `br`/`zstd`
+  branches that used to be there could never fire (nothing requested those encodings)
+  and would have raised `ImportError` if they had, since neither library is a
+  dependency; they were removed. To add one you need all three: the library in
+  `requirements.txt`, the branch, *and* the encoding advertised in `_build_headers`.
 - **Auth gate consistency.** Any new model-listing or routing path must apply the same
   `require_permission` filtering as `registry.list_models` and `proxy_request`.
 - **Never substitute a backend the client didn't ask for.** `router.resolve` returning `[]`
@@ -102,9 +148,13 @@ decompresses the response. Single process, async, one uvicorn worker.
   every model on that backend unresolvable for a full `cache_ttl` — which is what triggered
   the bug above. `clear_cache()` drops the last-known catalogs too, since a config reload
   may have repointed `base_url`.
-- **Admin surface (`/admin/*`, `/ui`).** Every `/admin/*` endpoint is gated by
-  `auth.is_authorized` (the log buffer can hold request/response bodies once
-  `LOG_INPUT`/`LOG_OUTPUT` are on). Provider serialization must **never** include
+- **Admin surface (`/admin/*`, `/ui`).** The gate is **structural**: every `/admin/*`
+  route is declared on the `admin` `APIRouter`, which carries
+  `Depends(require_admin)`, so a new endpoint is protected by construction. Declare
+  new admin routes on that router, never on `app` directly — the old per-handler
+  prologue failed silently, since an endpoint that forgot it was simply open. The
+  403 body is `{"error": "unauthorized"}` via `_AdminForbidden`; keep that shape,
+  the console and any scripts read it. Provider serialization must **never** include
   `api_key` — secrets stay in-process. `POST /admin/routing/{model}` mutates
   `LOGICAL_MODELS[*].targets` priorities in place and must re-`sort` the target list
   afterwards, or the priority-tier `groupby` in `slots._pick_free` breaks. Routes +
@@ -145,13 +195,15 @@ decompresses the response. Single process, async, one uvicorn worker.
   never 500s.
 - **A target's `model` is inherited when omitted — preserve that through an edit.**
   `Target.model is None` means "resolve via the provider's `model_map`", and
-  `configwrite._native_for` is the single place that resolution lives (mirroring
-  `router._from_logical`). Both sides of a priority write need it: callers hand over
-  live `Target`s where an inherited id is still `None`, while the file must be matched
-  on the id it resolves to. The config API likewise reports `model` raw and
-  `resolved_model` separately — collapsing them would make the editor write explicit
-  pins for every inherited target on the first save, changing what the config means
-  without changing what it says.
+  **`config.native_for` is the single place that resolution lives**. It used to be
+  three: inline in `router._from_logical`, plus near-identical copies in `main` and
+  `configwrite` — and this AGENTS.md claimed there was one. Call it, don't re-derive
+  it. Both sides of a priority write need it: callers hand over live `Target`s where
+  an inherited id is still `None`, while the file must be matched on the id it
+  resolves to. The config API likewise reports `model` raw and `resolved_model`
+  separately (`_serialize_targets(..., raw=True)`) — collapsing them would make the
+  editor write explicit pins for every inherited target on the first save, changing
+  what the config means without changing what it says.
 - **`api_key` never leaves the process, including through the config editor.**
   `_config_snapshot` emits `has_api_key`, never the value; `configwrite` reads and
   writes key lines back verbatim without ever returning one. Any new config endpoint
@@ -177,6 +229,31 @@ decompresses the response. Single process, async, one uvicorn worker.
   the request task waits on client disconnect, so cancelling the latter mid-stream unwinds
   through Starlette's disconnect listener and uvicorn logs a spurious "Exception in ASGI
   application" traceback for a deliberate action.
+- **Outbound calls use the shared clients in `app/upstream.py`; never build one
+  per request.** Both were `httpx.AsyncClient(...)` constructed and closed inside the
+  handler, which threw the connection pool away after a single call — every request to
+  a remote backend paid a fresh TCP handshake plus a full TLS negotiation. The clients
+  are process-wide and closed by the lifespan, so **never `aclose()` one from a request
+  path**; a stream returns its connection by exiting `stream_cm`, nothing more. A stale
+  pooled connection surfaces as `httpx.RemoteProtocolError`, a `RequestError` subclass,
+  so the existing failover handles it.
+- **The forwarding timeout is long-read, short-connect, and both halves matter.**
+  `FORWARD_TIMEOUT = httpx.Timeout(600.0, connect=5.0)`. The 600s read is deliberate:
+  a large model loading, or a backend that buffers the whole completion, routinely
+  spends minutes before the first byte. Do not shorten it. The short connect is equally
+  deliberate: a bare `Timeout(600.0)` sets *connect* to 600s too, and since a handshake
+  completes in the kernel before the request is sent, no model-loading time lands
+  there — the only way to wait on connect is a host that black-holes SYN, which will
+  never answer. That request holds its slot for the whole wait, so on a single-slot
+  local backend one bad request was a ten-minute outage, with `down_backoff` never
+  engaging because nothing had failed yet.
+- **The request log carries both model names.** `model=` is the **native** id on the
+  wire and must stay that way — existing dashboards and recording rules key off it.
+  `asked=` is the canonical name the client sent, added because a logical model
+  spanning three backends resolves to three different native ids, so `model=` alone
+  splits one model's traffic across three series and a failover moves a request between
+  them mid-flight. `asked=` is the field to group by. It is omitted when the two are
+  equal, so an unmapped model logs exactly as before.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
 - **Never persist or re-seed the counters.** A restart resetting them to zero is a real
   counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
@@ -205,18 +282,47 @@ decompresses the response. Single process, async, one uvicorn worker.
 
 ## Testing
 
-No formal suite yet. Validate changes by importing with a config and exercising the
-async functions directly, e.g.:
+pytest + pytest-asyncio, no network, sub-second:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite exists because most of the section above is invariants — properties that
+are invisible in review and expensive in production. Each file guards a specific
+one:
+
+| File | Guards |
+|---|---|
+| `tests/test_slots.py` | Priority admission, round-robin within a tie tier, queue-when-full, the synchronous handoff (no barging), affinity reordering, the `affinity_max_skips` starvation bound, and **no slot stranded** by timeout or cancellation. |
+| `tests/test_configwrite.py` | Formatting fidelity — comments, key order, quote style, block-vs-flow lists — and the headline case: **two consecutive identical saves must leave the file byte-identical.** Plus abort-don't-corrupt on every refusal path. |
+| `tests/test_router.py` | Resolution order, inherited vs pinned native ids, and that an unknown model resolves to `[]` and **never** to `PROVIDERS[0]`. Also that `_auto_group` subsumes `_allow_listed`, which is what lets the latter live behind `auto_group: false`. |
+| `tests/test_proxy.py` | The full lifecycle through `httpx.MockTransport`: failover on both triggers, error relay, streaming, decompression, the request log. Every test asserts slot occupancy returns to zero. |
+| `tests/test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and that `api_key` never appears in a response. |
+| `tests/test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped with no build step, so a dropped field shows up as a blank cell rather than an error. |
+
+Conventions that matter when adding tests:
+
+- `tests/conftest.py` sets `CONFIG_PATH` **before** anything imports `app.*`, because
+  `config.py` reads it at import time.
+- `reset_state` is autouse and clears the process-local dicts between tests. Add new
+  process-local state to it, or tests leak into each other.
+- Use `load_config(text)` to install a config and `providers(...)` to install
+  `Provider` objects directly; both go through the real code paths.
+- Mock upstream with `httpx.MockTransport`, and build responses with
+  `test_proxy.mock_response` — a plain `httpx.Response(json=...)` arrives with its
+  content already consumed and `aiter_raw()` raises `StreamConsumed`.
+- `test_proxy.py` deliberately sets `queue_timeout: 3` rather than the production
+  default of 0. Both backends have one slot, so a leaked slot under "wait forever"
+  hangs the suite instead of failing it; the wait-forever path is covered directly in
+  `test_slots.py`.
+
+A quick smoke check without the suite:
 
 ```bash
 CONFIG_PATH=config.example.yaml python -c "from app import main; print('imports OK')"
 ```
-
-For routing/slots/auth, drive the functions with mock backends (local `http.server`)
-and mock `registry.provider_model_ids` / `registry._cached_live` for discovery. Cover:
-priority admission, queue-when-full, cancellation (no slot leak), failover, the 401 gate,
-and streaming slot release. Prefer adding a real `tests/` suite (pytest + pytest-asyncio)
-if you extend behavior substantially.
 
 ## Canonical naming model
 

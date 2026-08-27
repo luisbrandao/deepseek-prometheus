@@ -83,6 +83,30 @@ class Provider:
         return self._to_native.get(canonical, canonical)
 
 
+def native_for(model_name: str, provider_name: str, model: Optional[str] = None) -> str:
+    """The native wire id a logical target resolves to.
+
+    `model` is a `Target.model`: the explicit native id when the config pins one,
+    or None meaning "inherit", i.e. reverse-map the logical (canonical) name
+    through that provider's model_map.
+
+    This is the **single** home for that rule, and it has to be, because four
+    places need to agree on it: routing sends the result on the wire
+    (`router._from_logical`), the routing view uses it as a target's stable
+    identity, the config editor must tell an inherited id from a pinned one
+    (writing a resolved id back would silently turn every inherited target into
+    an explicit pin), and `configwrite` has to match a live `Target` — where an
+    inherited id is still None — against a file entry that may spell it out.
+
+    Falls back to the bare name for an unknown provider so a half-finished config
+    edit degrades to something inspectable rather than raising.
+    """
+    if model is not None:
+        return model
+    p = PROVIDERS_BY_NAME.get(provider_name)
+    return p.to_native(model_name) if p else model_name
+
+
 def strip_prefix(provider, path: str) -> str:
     """Drop a backend's `strip_path_prefix` from an incoming path (if present)."""
     p = path.lstrip("/")

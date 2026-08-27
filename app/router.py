@@ -46,7 +46,7 @@ def _from_logical(raw: str):
                 raw, t.provider,
             )
             continue
-        model = t.model if t.model is not None else p.to_native(lm.name)
+        model = conf.native_for(lm.name, t.provider, t.model)
         out.append(conf.Target(t.provider, model, t.priority))
     # Every target dangling: treat the entry as absent so resolution can still
     # fall through to auto-group rather than dead-ending on a broken block.
@@ -70,18 +70,15 @@ async def _auto_group(raw: str):
 
 
 def _allow_listed(raw: str):
-    """First provider whose `enabled_models` explicitly serves this canonical
-    model. The wire id is that provider's native mapping.
+    """First provider whose `enabled_models` explicitly serves this canonical model.
 
-    There is deliberately **no** last-resort guess after this. Sending an
-    unresolved model to `PROVIDERS[0]` used to look like graceful degradation and
-    was in fact a trap: a caller asking for a local model during a momentary
-    discovery blip got silently routed to whichever backend happened to be first
-    in the config. If that backend is `require_permission`, an unauthenticated
-    caller — who can neither see nor use it — receives a *401 about a model they
-    never asked for*. That is unexplainable from the client side, and it happened
-    in production. A model nothing is known to serve now resolves to nothing, and
-    the caller gets a straight 404 (see `proxy._model_not_found`).
+    Only reachable with `auto_group: false`. With auto-grouping on — the default —
+    `_auto_group` already covers every name this could match: for a provider with
+    an explicit allow-list it iterates exactly `enabled_models`, and since
+    `model_map` is a bijection, testing `to_canonical(native) == raw` accepts the
+    same set of names as testing `to_native(raw) in enabled_models`. The
+    difference is only multiplicity — auto-group returns every provider that
+    serves the name, this returns the first.
     """
     for p in conf.PROVIDERS:
         native = p.to_native(raw)
@@ -96,9 +93,18 @@ async def resolve(raw_model: str) -> List[conf.Target]:
     Order: alias expansion -> explicit `provider:model` -> explicit `models:`
     entry -> auto-grouped identical ids -> allow-listed single provider.
 
-    Returns an empty list when no backend is known to serve the model. Callers
-    must treat that as "not available" and must not substitute a backend of their
-    own choosing; see `_allow_listed` for what that used to cost.
+    Returns an empty list when no backend is known to serve the model, and there
+    is deliberately **no** last-resort guess after the final step.
+
+    Sending an unresolved model to `PROVIDERS[0]` used to look like graceful
+    degradation and was in fact a trap: a caller asking for a local model during a
+    momentary discovery blip got silently routed to whichever backend happened to
+    be listed first. When that backend is `require_permission`, an unauthenticated
+    caller — who can neither see nor use it — receives a *401 about a model they
+    never asked for*, which is unexplainable from the client side. It happened in
+    production. A model nothing is known to serve resolves to nothing, and the
+    caller gets a straight 404 (`proxy._model_not_found`). Callers must not
+    substitute a backend of their own choosing.
     """
     raw = conf.ALIASES.get(raw_model, raw_model)
 
@@ -111,8 +117,8 @@ async def resolve(raw_model: str) -> List[conf.Target]:
         return logical
 
     if conf.ROUTING.auto_group:
-        grouped = await _auto_group(raw)
-        if grouped:
-            return grouped
+        return await _auto_group(raw)
 
+    # Auto-grouping off: fall back to a single allow-listed provider. With it on,
+    # _auto_group is a strict superset of this (see _allow_listed).
     return _allow_listed(raw)

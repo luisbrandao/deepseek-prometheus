@@ -167,6 +167,24 @@ client gets the last upstream error verbatim (its real status and body), not a s
 502. Streaming requests can fail over up to the first byte (after that the HTTP status is
 already committed).
 
+### Upstream timeouts and connection reuse
+
+All outbound calls share one pooled `httpx` client (`app/upstream.py`), so a request to
+a remote backend reuses an established TLS connection instead of renegotiating one.
+
+Its timeouts are split on purpose:
+
+- **read: 600s.** Generation legitimately takes minutes — a large model loading, a long
+  prompt to process, or an aggregator that buffers the whole completion before sending
+  anything. This is meant to be generous and shouldn't be shortened.
+- **connect: 5s.** A TCP handshake completes in the kernel before the request is even
+  sent, so no amount of model-loading time lands here. A backend that's down *refuses*
+  instantly; the only way to sit waiting on connect is a host that silently drops
+  packets — powered off behind a router, or a firewall `DROP` rule — and that connection
+  is never going to succeed. Since the request is holding a slot the whole time, one
+  such request to a single-slot local backend used to stall it for a full ten minutes,
+  with `down_backoff` never kicking in because nothing had failed yet.
+
 ## Configuration
 
 All routing config lives in `config.yaml` (see `config.example.yaml`). Provider API keys
@@ -466,7 +484,7 @@ The **Kill** button cancels the asyncio task serving that request, which unwinds
 ordinary cleanup path: the slot is released, the upstream connection closed, and the
 request moves into the history as `cancelled`. Cancellation rather than a flag, because
 the requests worth killing are blocked inside an `await` — a queued one inside the slot
-Condition, a running one inside an upstream read that may never return.
+waiter future, a running one inside an upstream read that may never return.
 
 What the caller sees depends on how far the request got:
 
@@ -593,13 +611,14 @@ Every completed request — success **or** error — emits exactly one structure
 [logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
-ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 status=200 stream=true in=5524 out=890 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
+ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 asked=glm-5.2 status=200 stream=true in=5524 out=890 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
 ```
 
 | Field | Meaning |
 |---|---|
 | `ts` | ISO-8601 timestamp **with offset** (local time per `TZ`; unambiguous regardless of reader) |
-| `provider`, `model` | Backend chosen and the upstream model id sent to it |
+| `provider`, `model` | Backend chosen and the **native** model id sent to it |
+| `asked` | The model name the **client** sent, when it differs from `model`. A group spanning three backends resolves to three different native ids, so `model=` alone splits one model's traffic across three series — and a failover moves a request between them mid-flight. Group by `asked` to chart what people actually requested; omitted when the two names are identical |
 | `status` | Upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
 | `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
@@ -696,7 +715,22 @@ Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOK
 - **prometheus-client** — native metrics
 - **PyYAML** — config parsing
 - **ruamel.yaml** — comment-preserving config *writes* from the console
+- **pytest** + **pytest-asyncio** — test suite (dev only, see below)
 - **Python 3.11**
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+95 tests, no network, well under a second. They exist to pin the properties that
+are invisible in review: that every acquired slot is released on every exit path
+(including timeout and cancellation), that two identical config saves leave the
+file byte-identical, that an unknown model 404s instead of being routed to an
+arbitrary backend, and that the fields the web console reads from `/admin/*` are
+all still there. `AGENTS.md` has the per-file breakdown.
 
 ## License
 

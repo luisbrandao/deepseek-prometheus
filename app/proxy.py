@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, clientinfo, inflight, registry, router, slots
+from app import auth, clientinfo, inflight, registry, router, slots, upstream
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -64,9 +64,20 @@ def _build_headers(provider: Provider, request: Request) -> dict:
 def _decompress(raw: bytes, encoding: str) -> bytes:
     """Decompress an upstream response body based on its Content-Encoding.
 
-    Handles gzip, deflate, brotli and zstd. Unknown or empty encodings are
-    returned unchanged. If decompression fails the raw bytes are returned so
-    the proxy never crashes on an unexpected body.
+    Handles exactly what `_build_headers` advertises — gzip and deflate, both
+    stdlib. Keep the two aligned: asking for an encoding we cannot decode means a
+    backend may answer with a body we can only pass through compressed.
+
+    There used to be `br` and `zstd` branches here. They could not work: the
+    forwarded `Accept-Encoding` is capped at `gzip, deflate`, so they only fired
+    if a backend ignored the header, and `brotli`/`zstandard` are not
+    dependencies — so they raised ImportError, got swallowed, and returned the
+    still-compressed bytes. The code read as a capability and behaved as a
+    fallback. To genuinely support one, add the library to requirements.txt, add
+    the branch, *and* advertise it in `_build_headers`.
+
+    Unknown or empty encodings are returned unchanged, and a decompression failure
+    returns the raw bytes, so this never crashes the proxy on an odd body.
     """
     encoding = (encoding or "").strip().lower()
     if not encoding or encoding == "identity":
@@ -81,14 +92,6 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
             except zlib.error:
                 # Raw deflate stream without zlib header/trailer.
                 return zlib.decompress(raw, -zlib.MAX_WBITS)
-        if encoding == "br":
-            import brotli  # type: ignore
-
-            return brotli.decompress(raw)
-        if encoding == "zstd":
-            import zstandard  # type: ignore
-
-            return zstandard.ZstdDecompressor().decompress(raw)
     except Exception as e:  # noqa: BLE001 - never let decompression crash the proxy
         logger.warning(f"Failed to decompress '{encoding}' response: {e}")
         return raw
@@ -168,6 +171,7 @@ def _op_kind(path: str, model: str):
 async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
     in_tokens: int, out_tokens: int, duration: float, stream: bool,
+    asked: Optional[str] = None,
 ) -> None:
     """Emit the single, always-on, parseable line summarizing one request.
 
@@ -175,6 +179,17 @@ async def _emit_request_log(
     outcome (status, token counts, speed) and whether it streamed. Runs after
     the response is delivered (background task / stream finally) so the
     reverse-DNS lookup never adds latency to the client.
+
+    `model` is the **native** id that went on the wire, and stays that way for
+    compatibility with existing dashboards and recording rules. `asked` is the
+    name the *client* sent, emitted as its own `asked=` field, because those two
+    routinely differ and only one of them is a stable thing to group by: a
+    logical model spanning three backends resolves to three different native ids
+    via each provider's model_map, so `model=` alone splits one model's traffic
+    across three series — and a request that fails over moves between them
+    mid-flight. `asked=` is what somebody actually typed into a client, so it is
+    the field to sum over. Both are kept: the native id is what you need to ask a
+    backend about its own logs.
 
     A model-less passthrough (non-chat / multipart body, nothing to resolve) is
     logged as `event=passthrough` keyed by request path — never as a bogus
@@ -206,6 +221,10 @@ async def _emit_request_log(
             "event": "request",
             "provider": provider,
             "model": model,
+            # The canonical name the client sent, when it differs from the native
+            # id above. Dropped by _logfmt when equal or absent, so an unmapped
+            # model logs exactly as it did before.
+            "asked": asked if asked and asked != model else None,
             "op": op,
             "status": status,
             "stream": "true" if stream else "false",
@@ -252,6 +271,40 @@ def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, 
     REQUEST_DURATION.labels(provider=provider, model=model).observe(duration)
 
 
+def _error(status: int, message: str, kind: str, code=None, **extra) -> Response:
+    """An OpenAI-shaped error response.
+
+    Every terminal error the proxy generates itself goes through here, so the
+    envelope stays identical across them — clients key off `error.type`, and five
+    hand-built literals had already started to drift on whether `code` was an int
+    or a string. `code` defaults to the HTTP status; pass a string for the cases
+    OpenAI spells out (e.g. `model_not_found`). `extra` adds sibling fields such
+    as `param`.
+
+    Not used for relaying an *upstream* error: that body is passed through
+    verbatim so the backend's own explanation survives.
+    """
+    payload = {"error": {"message": message, "type": kind, "code": status if code is None else code}}
+    payload["error"].update(extra)
+    return Response(
+        content=json.dumps(payload), status_code=status, media_type="application/json"
+    )
+
+
+def _relay_headers(headers: dict) -> dict:
+    """Upstream response headers, minus the ones that describe a body we changed.
+
+    We decompressed the body and hand it to Starlette to re-frame, so the
+    upstream's length, framing and encoding headers now all describe something
+    that no longer exists — forwarding any of them corrupts the response.
+    """
+    out = dict(headers)
+    out.pop("content-length", None)
+    out.pop("transfer-encoding", None)
+    out.pop("content-encoding", None)
+    return out
+
+
 def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
     """Build a clean OpenAI-style error when an upstream backend is unreachable.
 
@@ -268,18 +321,7 @@ def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
     if model != "unknown":
         ERRORS_TOTAL.labels(provider=provider.name, model=model, status_code=str(status)).inc()
 
-    payload = {
-        "error": {
-            "message": f"Upstream backend '{provider.name}' is unavailable: {exc}",
-            "type": kind,
-            "code": status,
-        }
-    }
-    return Response(
-        content=json.dumps(payload),
-        status_code=status,
-        media_type="application/json",
-    )
+    return _error(status, f"Upstream backend '{provider.name}' is unavailable: {exc}", kind)
 
 
 async def _handle_non_stream(
@@ -290,6 +332,9 @@ async def _handle_non_stream(
     headers = _build_headers(provider, request)
     method = request.method.upper()
     pname = provider.name
+    # The name the client sent, for the log's `asked=` field. The in-flight entry
+    # already carries it, so nothing extra has to be threaded down here.
+    asked = entry.model if entry is not None else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -297,17 +342,19 @@ async def _handle_non_stream(
     start = time.time()
 
     # Connection failures propagate as httpx.RequestError so the dispatcher can
-    # fail over to the next backend; the response is fully buffered here.
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        async with client.stream(method, url, headers=headers, content=body) as resp:
-            # Read the raw, undecoded bytes so we control decompression
-            # ourselves (httpx cannot decode brotli/zstd without extra libs
-            # and would otherwise pass compressed bytes straight through).
-            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
-            status_code = resp.status_code
-            is_error = resp.is_error
-            resp_headers = dict(resp.headers)
-            content_encoding = resp.headers.get("content-encoding", "")
+    # fail over to the next backend; the response is fully buffered here. The
+    # client is process-wide (see app/upstream.py) so the connection is reused —
+    # never close it here.
+    client = upstream.forward_client()
+    async with client.stream(method, url, headers=headers, content=body) as resp:
+        # Read the raw, undecoded bytes so we control decompression ourselves
+        # (httpx cannot decode brotli/zstd without extra libs and would
+        # otherwise pass compressed bytes straight through).
+        raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+        status_code = resp.status_code
+        is_error = resp.is_error
+        resp_headers = dict(resp.headers)
+        content_encoding = resp.headers.get("content-encoding", "")
 
     duration = time.time() - start
 
@@ -345,17 +392,13 @@ async def _handle_non_stream(
         entry.record(status_code, in_tokens, out_tokens)
         entry.add_response(resp_body)
 
-    resp_headers.pop("content-length", None)
-    resp_headers.pop("transfer-encoding", None)
-    resp_headers.pop("content-encoding", None)
-
     return Response(
         content=resp_body,
         status_code=status_code,
-        headers=resp_headers,
+        headers=_relay_headers(resp_headers),
         background=BackgroundTask(
             _emit_request_log, request, pname, model, status_code,
-            in_tokens, out_tokens, duration, False,
+            in_tokens, out_tokens, duration, False, asked,
         ),
     )
 
@@ -368,6 +411,8 @@ async def _handle_stream(
     headers = _build_headers(provider, request)
     method = request.method.upper()
     pname = provider.name
+    # See _handle_non_stream: the client-facing name for the log's `asked=` field.
+    asked = entry.model if entry is not None else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -384,16 +429,15 @@ async def _handle_stream(
     # spends all its time before the first byte — timing only the body read
     # would yield near-zero durations and absurd tokens/sec.
     start = time.time()
-    client = httpx.AsyncClient(timeout=600.0)
-    stream_cm = client.stream(method, url, headers=headers, content=body)
-    try:
-        resp = await stream_cm.__aenter__()
-    except BaseException:
-        # RequestError (the dispatcher fails over on it) or cancellation (an
-        # operator kill landing while we connect) — either way this client would
-        # otherwise leak its connection. Re-raised unchanged.
-        await client.aclose()
-        raise
+    stream_cm = upstream.forward_client().stream(
+        method, url, headers=headers, content=body
+    )
+    # A failure here — RequestError (the dispatcher fails over on it) or
+    # cancellation (an operator kill landing while we connect) — propagates
+    # unchanged. There is nothing to clean up: __aenter__ raising means the
+    # stream never took a connection from the shared pool, and the client itself
+    # is process-wide, so closing it here would break every other request.
+    resp = await stream_cm.__aenter__()
 
     # Upstream rejected the request outright (4xx/5xx). A StreamingResponse
     # commits a 200 before its generator runs, which would bury the error in a
@@ -406,8 +450,9 @@ async def _handle_stream(
             resp_headers = dict(resp.headers)
             content_encoding = resp.headers.get("content-encoding", "")
         finally:
+            # Closes the response and returns its connection to the shared
+            # pool. The client is process-wide — never aclose() it here.
             await stream_cm.__aexit__(None, None, None)
-            await client.aclose()
             if on_complete is not None:
                 await on_complete()
 
@@ -419,15 +464,13 @@ async def _handle_stream(
         if model != "unknown":
             ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
 
-        resp_headers.pop("content-length", None)
-        resp_headers.pop("transfer-encoding", None)
-        resp_headers.pop("content-encoding", None)
         return Response(
             content=resp_body,
             status_code=status_code,
-            headers=resp_headers,
+            headers=_relay_headers(resp_headers),
             background=BackgroundTask(
-                _emit_request_log, request, pname, model, status_code, 0, 0, 0.0, True,
+                _emit_request_log, request, pname, model, status_code, 0, 0, 0.0,
+                True, asked,
             ),
         )
 
@@ -513,8 +556,9 @@ async def _handle_stream(
             if entry is not None:
                 entry.record(status_code, in_tokens, out_tokens)
                 entry.finish()
+            # Closes the response and returns its connection to the shared
+            # pool. The client is process-wide — never aclose() it here.
             await stream_cm.__aexit__(None, None, None)
-            await client.aclose()
             if on_complete is not None:
                 await on_complete()
             if model != "unknown":
@@ -523,7 +567,8 @@ async def _handle_stream(
                 else:
                     _record_metrics(pname, model, in_tokens, out_tokens, duration)
             await _emit_request_log(
-                request, pname, model, status_code, in_tokens, out_tokens, duration, True,
+                request, pname, model, status_code, in_tokens, out_tokens, duration,
+                True, asked,
             )
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
@@ -634,10 +679,8 @@ async def _dispatch(
                 remaining, conf.ROUTING.queue_timeout, on_skip=entry.passed_over
             )
         except slots.SlotTimeout:
-            return Response(
-                content=json.dumps({"error": {"message": "No backend slot available (queue timeout)", "type": "slot_timeout", "code": 503}}),
-                status_code=503,
-                media_type="application/json",
+            return _error(
+                503, "No backend slot available (queue timeout)", "slot_timeout"
             )
 
         provider = conf.PROVIDERS_BY_NAME.get(target.provider)
@@ -726,14 +769,7 @@ def _cancelled_response() -> Response:
     """Terminal response for a request killed from the console. 503 with an
     OpenAI-shaped error body, matching the slot-timeout response, so clients
     handle it as an ordinary upstream failure rather than a protocol surprise."""
-    payload = {
-        "error": {
-            "message": "Request cancelled by the proxy operator",
-            "type": "cancelled",
-            "code": 503,
-        }
-    }
-    return Response(content=json.dumps(payload), status_code=503, media_type="application/json")
+    return _error(503, "Request cancelled by the proxy operator", "cancelled")
 
 
 def _model_not_found(model: str, request: Request) -> Response:
@@ -752,28 +788,21 @@ def _model_not_found(model: str, request: Request) -> Response:
         "Returning 404 rather than guessing a backend.",
         model, ip, clientinfo.service_from_ua(ua),
     )
-    payload = {
-        "error": {
-            "message": (
-                f"The model '{model}' does not exist or is not available on this proxy"
-            ),
-            "type": "invalid_request_error",
-            "param": "model",
-            "code": "model_not_found",
-        }
-    }
-    return Response(content=json.dumps(payload), status_code=404, media_type="application/json")
+    return _error(
+        404,
+        f"The model '{model}' does not exist or is not available on this proxy",
+        "invalid_request_error",
+        code="model_not_found",
+        param="model",
+    )
 
 
 def _unauthorized(model: str) -> Response:
-    payload = {
-        "error": {
-            "message": f"Model '{model}' requires authentication" if model else "Authentication required",
-            "type": "unauthorized",
-            "code": 401,
-        }
-    }
-    return Response(content=json.dumps(payload), status_code=401, media_type="application/json")
+    return _error(
+        401,
+        f"Model '{model}' requires authentication" if model else "Authentication required",
+        "unauthorized",
+    )
 
 
 async def proxy_request(request: Request, path: str) -> Union[Response, StreamingResponse]:

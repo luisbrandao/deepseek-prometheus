@@ -104,21 +104,6 @@ def _serialize(doc) -> str:
     return buf.getvalue()
 
 
-def _native_for(model_name: str, provider_name: str, native):
-    """The native wire id a target uses: its explicit `model`, else the logical name
-    reverse-mapped through the provider's model_map.
-
-    Mirrors `router._from_logical`. Needed on both sides of a priority write: the
-    caller hands us `Target`s straight out of the live config, where an inherited
-    id is still `None`, while the file has to be matched on the id it actually
-    resolves to.
-    """
-    if native is not None:
-        return native
-    p = conf.PROVIDERS_BY_NAME.get(provider_name)
-    return p.to_native(model_name) if p else model_name
-
-
 def _providers_of(doc):
     return doc.get("providers") or []
 
@@ -128,6 +113,21 @@ def _find_provider(doc, name: str):
         if entry.get("name") == name:
             return entry
     return None
+
+
+def _check_provider_field(parsed, provider_name: str, field: str, verify):
+    """Self-check helper for a per-provider edit.
+
+    Finds `provider_name` in the re-parsed document and hands its `field` value to
+    `verify`, which returns None when the written value is what was asked for or a
+    reason string when it isn't. A provider that is no longer there at all is
+    always a failure — `_commit` guards the provider *list*, but this catches a
+    rename or a mangled entry.
+    """
+    for entry in parsed.get("providers") or []:
+        if entry.get("name") == provider_name:
+            return verify(entry.get(field))
+    return f"self-check failed: provider '{provider_name}' vanished"
 
 
 def _commit(doc, before_text: str, check):
@@ -196,7 +196,7 @@ async def persist_model_priorities(model: str, targets) -> tuple:
     so this can never invent or drop a target.
     """
     wanted = {
-        (t.provider, _native_for(model, t.provider, t.model)): t.priority for t in targets
+        (t.provider, conf.native_for(model, t.provider, t.model)): t.priority for t in targets
     }
 
     def mutate(doc):
@@ -209,7 +209,8 @@ async def persist_model_priorities(model: str, targets) -> tuple:
         seen = {}
         for entry in entries:
             provider = entry.get("provider")
-            key = (provider, _native_for(model, provider, entry.get("model")))
+            native = conf.native_for(model, provider, entry.get("model"))
+            key = (provider, native)
             if key not in wanted:
                 return f"target {provider}/{native} is in the config but not in the request"
             entry["priority"] = wanted[key]
@@ -224,7 +225,7 @@ async def persist_model_priorities(model: str, targets) -> tuple:
         got = {}
         for entry in entries:
             provider = entry.get("provider")
-            got[(provider, _native_for(model, provider, entry.get("model")))] = entry.get("priority")
+            got[(provider, conf.native_for(model, provider, entry.get("model")))] = entry.get("priority")
         if got != wanted:
             return "self-check failed: priorities in the rewritten file don't match the request"
         return None
@@ -267,13 +268,11 @@ async def set_enabled_models(provider_name: str, models) -> tuple:
         return None
 
     def check(parsed):
-        for entry in parsed.get("providers") or []:
-            if entry.get("name") == provider_name:
-                got = entry.get("enabled_models") or []
-                if list(got) != wanted:
-                    return "self-check failed: enabled_models in the rewritten file don't match"
-                return None
-        return f"self-check failed: provider '{provider_name}' vanished"
+        def verify(got):
+            if list(got or []) != wanted:
+                return "self-check failed: enabled_models in the rewritten file don't match"
+            return None
+        return _check_provider_field(parsed, provider_name, "enabled_models", verify)
 
     return await _edit(mutate, check)
 
@@ -317,13 +316,11 @@ async def set_model_map(provider_name: str, mapping: dict) -> tuple:
         return None
 
     def check(parsed):
-        for entry in parsed.get("providers") or []:
-            if entry.get("name") == provider_name:
-                got = {str(k): str(v) for k, v in (entry.get("model_map") or {}).items()}
-                if got != wanted:
-                    return "self-check failed: model_map in the rewritten file doesn't match"
-                return None
-        return f"self-check failed: provider '{provider_name}' vanished"
+        def verify(got):
+            if {str(k): str(v) for k, v in (got or {}).items()} != wanted:
+                return "self-check failed: model_map in the rewritten file doesn't match"
+            return None
+        return _check_provider_field(parsed, provider_name, "model_map", verify)
 
     return await _edit(mutate, check)
 
