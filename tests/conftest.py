@@ -22,6 +22,17 @@ sys.path.insert(0, str(ROOT))
 
 # Must precede the first `import app.*` anywhere in the suite.
 FIXTURE_CONFIG = ROOT / "tests" / "fixtures" / "config.yaml"
+if not FIXTURE_CONFIG.exists():
+    # Fail with the actual problem rather than a FileNotFoundError raised four
+    # frames deep inside config.py's import-time _boot(). This has happened once
+    # already: the repo's `.gitignore` had an unanchored `config.yaml` rule, which
+    # matched this fixture too, so it was never committed — the suite passed
+    # locally and CI failed on a checkout that had never seen the file.
+    raise RuntimeError(
+        f"missing test fixture: {FIXTURE_CONFIG}\n"
+        f"If it exists locally but not in CI, check `git check-ignore -v {FIXTURE_CONFIG}` "
+        f"— it may be gitignored and therefore absent from a fresh checkout."
+    )
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402

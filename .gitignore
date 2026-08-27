@@ -2,7 +2,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
-config.yaml
+
+# The production config, at the repo root — never committed, it holds provider
+# keys. Root-anchored (`/config.yaml`) on purpose: unanchored, this pattern also
+# matched `tests/fixtures/config.yaml`, which silently kept the test fixture out
+# of the repo. The suite passed locally, where the file existed, and CI failed on
+# a checkout that had never seen it.
+/config.yaml
 
 # Leftovers from the removed METRICS_PERSIST feature. Counters are deliberately
 # never persisted (see AGENTS.md); these stay ignored only so an old deploy's

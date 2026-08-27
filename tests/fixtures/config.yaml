@@ -1,0 +1,31 @@
+# Minimal config imported at collection time so `app.config` has something to
+# parse. Individual tests install their own via the `load_config` fixture.
+models:
+  shared-model:
+    targets:
+      - {provider: alpha, priority: 1}
+      - {provider: beta,  priority: 2}
+
+providers:
+  - name: alpha
+    base_url: "http://127.0.0.1:1/v1"
+    slots: 1
+    model_map:
+      "vendor/Shared-Model-A": shared-model
+    enabled_models: ["vendor/Shared-Model-A"]
+
+  - name: beta
+    base_url: "http://127.0.0.1:2/v1"
+    slots: 2
+    require_permission: true
+    model_map:
+      "other/shared-model-b": shared-model
+    enabled_models: ["other/shared-model-b"]
+
+routing:
+  queue_timeout: 0
+  failover: true
+  auto_group: true
+
+auth:
+  keys: ["test-key"]
