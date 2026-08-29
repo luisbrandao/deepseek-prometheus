@@ -13,7 +13,16 @@ services:
       - PORT=8000
       - PROXY_API_KEYS=sk-1234
     volumes:
-      # rw so runtime routing edits from the web console persist into the file.
+      # rw so config edits from the web console persist into the file.
+      #
+      # NOTE: production mounts the config's *directory* (see the deploy repo),
+      # because a single-file bind mount is pinned to one inode: anything that
+      # replaces the file by rename — git pull/checkout, or an editor saving
+      # atomically — orphans the running container's copy, and every console save
+      # then goes into a file nobody else can see until the next recreate throws
+      # it away. This dev mount is still file-scoped for convenience; the proxy
+      # detects the stale state and refuses to write (a red banner in the Config
+      # tab), but if you hit it, recreate: docker compose up -d --force-recreate.
       - ./config.yaml:/app/config.yaml
     ports:
       - "9999:8000"

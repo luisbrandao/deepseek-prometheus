@@ -16,7 +16,7 @@ involved, and the image tag is a build counter you must *read*, never guess.
 | App source (this repo) | `/dados/techmago/git/luis/llm-proxy` | GitHub — `luisbrandao/llm-proxy` |
 | Deploy repo (local clone) | `/dados/techmago/git/luis/techsytes-docker` | Gitea — `git.techsytes.com:techmago/techsytes-docker` |
 | Production compose | `<deploy repo>/monitoring/docker-compose.yml` | service `llm-proxy` |
-| Production proxy config | `<deploy repo>/monitoring/llmproxy.yaml` | bind-mounted **rw** at `/app/config.yaml` |
+| Production proxy config | `<deploy repo>/monitoring/llmproxy/config.yaml` | its **directory** is bind-mounted **rw** at `/app/conf` |
 | Production host | `gw.brandao` — `ssh techmago@gw.brandao` | deploy repo lives at `~/docker`, has git credentials |
 | Image | `ghcr.io/luisbrandao/llm-proxy` | tags: `latest` **and** `master-<run_number>` |
 
@@ -37,33 +37,30 @@ involved, and the image tag is a build counter you must *read*, never guess.
   `paths-ignore: ['**.md']`, so a push touching only `.md` files produces no run,
   no new tag, and nothing to deploy. Say so and stop rather than hunting for a
   tag that will never exist.
-- Deploying only *config* (`monitoring/llmproxy.yaml`)? Skip steps 1–2 entirely —
-  no image bump. But you **must still recreate the container**; see the warning
-  below. The hot-reload only helps if the container is still looking at the file
-  you edited.
+- Deploying only *config* (`monitoring/llmproxy/config.yaml`)? Skip steps 1–2
+  entirely: no image bump, no restart. The proxy polls the file and hot-reloads it
+  (`CONFIG_RELOAD_INTERVAL`), so a commit+push and the file in place is enough.
 
-> ### ⚠ Pulling a config change detaches the mount
+> ### Why the config lives in its own directory
 >
-> `monitoring/llmproxy.yaml` is a **single-file** bind mount, so it is pinned to
-> one inode. `git pull` / `checkout` / rebase do not edit files in place — they
-> write a new file and rename it over the old one. The instant that happens, a
-> running container is holding an **orphaned inode**: it keeps reading and
-> writing its own private copy, the console reports every save as successful, and
-> the whole lot vanishes when the container is next recreated. This has already
-> destroyed a session of console edits (2026-08-29).
+> `monitoring/llmproxy/` is mounted at `/app/conf` — the **directory**, never the
+> file. That is deliberate. A single-file bind mount is pinned to one inode, and
+> `git pull`/`checkout`/rebase do not edit files in place: they write a new file
+> and rename it over the old one. Under a file mount that instantly orphans a
+> running container's copy — it keeps reading and writing a private file nobody
+> else can see, the console reports every save as successful, and the lot vanishes
+> on the next recreate. It destroyed a session of console edits on 2026-08-29, and
+> `docker compose up -d` did not help: with no image change it leaves the stale
+> container running. A rename *inside* a mounted directory is visible, so this
+> cannot recur — verified on gw by renaming a file over the config and watching the
+> container follow the new inode.
 >
-> `docker compose up -d` will **not** save you: with no image change it sees
-> nothing to do and leaves the stale container running. After any pull that
-> touched `llmproxy.yaml`:
+> Do not "simplify" this back to `- ./llmproxy/config.yaml:/app/conf/config.yaml`.
 >
-> ```bash
-> docker compose up -d --force-recreate llm-proxy
-> ```
->
-> The proxy now detects this itself — `/admin/config` reports `detached: true`,
-> the Config tab shows a red "do not edit" banner and disables saving, and every
-> write is refused with the recreate command. If you see that banner, this is why.
-> The permanent fix is to mount the containing *directory* instead of the file.
+> The proxy also detects the stale state if it ever arises again: `/admin/config`
+> reports `detached: true`, the Config tab shows a red "do not edit" banner and
+> disables saving, and every write is refused with
+> `docker compose up -d --force-recreate llm-proxy`.
 
 ## 1. Commit and push the app
 
@@ -144,18 +141,19 @@ cd ~/docker/monitoring ; docker compose up -d
 ```
 
 > **Order matters: `commit` → `pull` → `push`.** Do not reorder. gw's checkout is
-> reliably dirty, and for a specific reason: `monitoring/llmproxy.yaml` is
-> bind-mounted read-write, and the proxy's own web console **writes routing
-> priority edits back into it** (`app/configwrite.py`). Any priority reordered
-> from `/ui/` shows up as an uncommitted change on gw. Committing first preserves
-> those live edits instead of letting `git pull` trip over them.
+> reliably dirty, and for a specific reason: `monitoring/llmproxy/config.yaml` is
+> bind-mounted read-write, and the proxy's own web console **writes config edits
+> back into it** (`app/configwrite.py`) — allow-lists, groups, aliases, model_map,
+> priorities. Anything changed from `/ui/` shows up as an uncommitted change on gw.
+> Committing first preserves those live edits instead of letting `git pull` trip
+> over them.
 
 `docker compose up -d` recreates only the services whose definition changed, so
 the rest of the monitoring stack (Prometheus, Loki, dcgm-exporter, …) is left
 alone. That is also why it is not enough on its own when the *config* moved and
 the image did not — use `--force-recreate llm-proxy` there.
 
-**If `git pull` conflicts on `llmproxy.yaml`:** you edited the config locally
+**If `git pull` conflicts on `llmproxy/config.yaml`:** you edited the config locally
 *and* someone reordered priorities in the production console. gw's version is
 the live truth — prefer it (`git checkout --ours`/keep gw's hunks), re-apply your
 intended edit on top, and push the merge.
