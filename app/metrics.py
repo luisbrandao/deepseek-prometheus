@@ -1,5 +1,21 @@
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
+from app import version
+
+
+# The conventional Prometheus way to expose build identity: a gauge that is
+# always 1, carrying the interesting values as labels. Makes the running version
+# queryable and joinable —
+#   llm_proxy_build_info                          -> what is deployed
+#   count(count by (version) (llm_proxy_build_info)) > 1  -> a mixed-version fleet
+# Set once at import; the labels never change for the life of the process.
+BUILD_INFO = Gauge(
+    "llm_proxy_build_info",
+    "Build identity of the running process; always 1, read the labels",
+    ["version", "revision"],
+)
+BUILD_INFO.labels(version=version.VERSION, revision=version.REVISION or "").set(1)
+
 
 REQUESTS_TOTAL = Counter(
     "llm_proxy_requests_total",

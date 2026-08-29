@@ -144,10 +144,25 @@ ssh techmago@gw.brandao \
    curl -s localhost:8000/health"
 ```
 
-Expect the new `master-N` in the image column, a `Up …` status, and
-`{"status":"ok"}`. Then load `http://gw.brandao:8000/ui/` and check the console
-tabs render — the static console ships inside the image, so a stale tag is
-obvious there.
+Expect the new `master-N` in the image column, a `Up …` status, and a health body
+that **reports the same tag**:
+
+```json
+{"status":"ok","version":"master-52","revision":"1e5837a3…","release":true}
+```
+
+Those two must agree. `docker ps` shows what the compose file *asked* for;
+`version` is what the process actually running is built from (baked in at build
+time — see `app/version.py`). They diverge when a container wasn't really
+recreated, which is otherwise invisible. The one-liner worth running:
+
+```bash
+ssh techmago@gw.brandao \
+  'docker ps --filter name=llm-proxy --format "{{.Image}}" && curl -s localhost:8000/health'
+```
+
+Then load `http://gw.brandao:8000/ui/` and check the console tabs render — the
+header carries the same build chip, so a stale image is obvious at a glance.
 
 Note that metric counters reset on restart, along with slot/queue/health state
 and the log ring buffer — all of it is in-process. That reset is fine:
@@ -178,3 +193,5 @@ ssh techmago@gw.brandao 'cd ~/docker && git commit -am "Server Bump"; git pull; 
 - [ ] On gw: `commit` → `pull` → `push`, in that order
 - [ ] `docker compose up -d` from `~/docker/monitoring`
 - [ ] `docker ps` shows the new tag; `/health` and `/ui/` respond
+- [ ] `/health`'s `version` **equals** the tag in `docker ps` — otherwise the
+      container is still running an older build

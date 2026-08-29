@@ -68,5 +68,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Bake the build identity into the image so the running process can
+          # report it (app/version.py -> /health, /metrics, the console header).
+          # APP_VERSION must stay byte-identical to the `master-N` tag produced
+          # by the metadata step above, so "what the compose file pins" and
+          # "what is actually answering requests" are directly comparable.
+          build-args: |
+            APP_VERSION=master-${{ github.run_number }}
+            APP_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

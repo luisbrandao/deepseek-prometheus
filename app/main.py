@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, logbuffer, registry, slots, upstream
+from app import auth, configwrite, inflight, logbuffer, registry, slots, upstream, version
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -187,6 +187,11 @@ async def _config_reload_loop():
 async def lifespan(app: FastAPI):
     # Runs after uvicorn has configured its logging, so our reformat sticks.
     _unify_logging()
+    # First line that matters in `docker logs`: what is actually running.
+    logger.info(
+        "llm-proxy %s starting — %d providers, %d logical models, %d aliases",
+        version.summary(), len(conf.PROVIDERS), len(conf.LOGICAL_MODELS), len(conf.ALIASES),
+    )
     reload_task = (
         asyncio.create_task(_config_reload_loop())
         if conf.CONFIG_RELOAD_INTERVAL > 0
@@ -206,7 +211,19 @@ app = FastAPI(title="LLM Proxy", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """Liveness, plus which build is answering.
+
+    The version is here rather than behind the admin gate because this is the
+    endpoint a deploy already curls to confirm the container came up, and the
+    question it could not answer was "is this actually the build I just pinned?"
+    A compose file pinning `master-52` while a stale container keeps serving
+    `master-50` is invisible from the outside otherwise.
+
+    Unauthenticated, like `/metrics` — this is a build counter, not a
+    CVE-mappable version string, on a proxy that already lists its model catalog
+    to anonymous callers.
+    """
+    return {"status": "ok", **version.as_dict()}
 
 
 @app.get("/metrics")

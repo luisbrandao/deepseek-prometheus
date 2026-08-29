@@ -54,6 +54,20 @@ body {
 }
 .brand h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .2px; }
 .brand .sub { color: var(--muted); font-weight: 400; font-size: 12px; }
+/* Build tag in the header: the fastest way to spot a container still running a
+   stale image after a deploy. `dev` is dimmed, a real master-N build is not. */
+.build {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  cursor: default;
+  white-space: nowrap;
+}
+.build.release { color: var(--accent); border-color: var(--accent-2); }
 
 .key-area { display: flex; align-items: center; gap: 8px; }
 .key-label { color: var(--muted); font-size: 12px; }

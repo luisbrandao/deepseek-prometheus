@@ -22,6 +22,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
+| `app/version.py` | Build identity — `VERSION` (the image tag, e.g. `master-52`), `REVISION` (git sha), `summary()`, `as_dict()`. Read from `APP_VERSION`/`APP_REVISION` at import; baked in by the Dockerfile from CI build-args. **Not** hot-reloaded — it is build metadata, not config. |
 | `app/upstream.py` | The two shared `httpx.AsyncClient`s and their timeouts. Everything outbound goes through here so connections are pooled; `FORWARD_TIMEOUT` is long-read/short-connect on purpose. Closed by `main`'s lifespan. |
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
@@ -51,7 +52,7 @@ main.py                        ASGI entry: routes, /admin router, lifespan
             └─ registry.py     discovery + health
   registry · slots · inflight · auth · clientinfo · configwrite     services
        └─ config.py            the leaf everything reads
-  config.py · metrics.py · logbuffer.py · upstream.py               leaves
+  config.py · metrics.py · logbuffer.py · upstream.py · version.py   leaves
 ```
 
 `config.py` is the only module everything depends on, and it is read **per
@@ -254,6 +255,17 @@ independent rules. If you add process-local state, add it to the reset list in
   splits one model's traffic across three series and a failover moves a request between
   them mid-flight. `asked=` is the field to group by. It is omitted when the two are
   equal, so an unmapped model logs exactly as before.
+- **The version string must stay identical to the image tag.** CI passes
+  `APP_VERSION=master-${{ github.run_number }}` as a build-arg, which is the same value
+  the metadata step turns into the `master-N` image tag; `app/version.py` reads it and
+  `/health`, `/metrics` (`llm_proxy_build_info`) and the console header report it. That
+  equality is the whole point — the compose file pins a tag, and this is what lets you
+  confirm the process *answering requests* is that build rather than a container that
+  never got recreated. If you change how the tag is derived, change the build-arg in the
+  same commit. The `ARG` lines sit **after** `pip install` in the Dockerfile on purpose:
+  `APP_VERSION` changes every build, and an `ARG` above the install would invalidate that
+  layer every time. An undefined `ARG` expands to `""`, not to nothing, which is why
+  `version.py` treats blank as absent and reports `dev`.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
 - **Never persist or re-seed the counters.** A restart resetting them to zero is a real
   counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
@@ -299,6 +311,7 @@ one:
 | `tests/test_configwrite.py` | Formatting fidelity — comments, key order, quote style, block-vs-flow lists — and the headline case: **two consecutive identical saves must leave the file byte-identical.** Plus abort-don't-corrupt on every refusal path. |
 | `tests/test_router.py` | Resolution order, inherited vs pinned native ids, and that an unknown model resolves to `[]` and **never** to `PROVIDERS[0]`. Also that `_auto_group` subsumes `_allow_listed`, which is what lets the latter live behind `auto_group: false`. |
 | `tests/test_proxy.py` | The full lifecycle through `httpx.MockTransport`: failover on both triggers, error relay, streaming, decompression, the request log. Every test asserts slot occupancy returns to zero. |
+| `tests/test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` carries them, and `llm_proxy_build_info` is exposed. |
 | `tests/test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and that `api_key` never appears in a response. |
 | `tests/test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped with no build step, so a dropped field shows up as a blank cell rather than an error. |
 

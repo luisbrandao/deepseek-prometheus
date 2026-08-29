@@ -376,7 +376,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 
 | Path | Method | Description |
 |---|---|---|
-| `/health` | `GET` | `{"status": "ok"}` health check |
+| `/health` | `GET` | Health check **and build identity**: `{"status":"ok","version":"master-52","revision":"<sha>","release":true}` |
 | `/metrics` | `GET` | Prometheus-format metrics |
 | `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
 | `/logging` | `GET` | Current `log_input` / `log_output` state |
@@ -718,6 +718,47 @@ Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOK
 - **pytest** + **pytest-asyncio** — test suite (dev only, see below)
 - **Python 3.11**
 
+## Versioning
+
+The image tag and the version the process reports are the **same string**, so you
+can always tell whether the container answering requests is the build you pinned.
+
+CI passes the build identity into the image:
+
+```yaml
+build-args: |
+  APP_VERSION=master-${{ github.run_number }}   # identical to the image tag
+  APP_REVISION=${{ github.sha }}
+```
+
+The Dockerfile turns those into `ENV`, and `app/version.py` reads them once at
+startup. It shows up in four places:
+
+| Where | Looks like |
+|---|---|
+| Startup log | `llm-proxy master-52 (1e5837a3) starting — 8 providers, 9 logical models, 0 aliases` |
+| `GET /health` | `{"status":"ok","version":"master-52","revision":"1e5837a3…","release":true}` |
+| `GET /metrics` | `llm_proxy_build_info{version="master-52",revision="1e5837a3…"} 1.0` |
+| Console header | a `master-52` chip next to the title, hover for the commit |
+
+Built outside CI (a plain `docker build`, or running from a checkout) the version
+is `dev` with `release: false` — a truthful answer rather than a misleading
+number.
+
+Two things this makes possible that weren't before:
+
+```bash
+# does the running process agree with what the compose file pins?
+curl -s gw.brandao:8000/health | jq -r .version
+
+# alert on a fleet running mixed builds
+count(count by (version) (llm_proxy_build_info)) > 1
+```
+
+`/health` is unauthenticated, like `/metrics` — this is a build counter, not a
+CVE-mappable version string, on a proxy that already lists its catalog to
+anonymous callers.
+
 ## Tests
 
 ```bash
@@ -725,7 +766,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-95 tests, no network, well under a second. They exist to pin the properties that
+106 tests, no network, well under a second. They exist to pin the properties that
 are invisible in review: that every acquired slot is released on every exit path
 (including timeout and cancellation), that two identical config saves leave the
 file byte-identical, that an unknown model 404s instead of being routed to an

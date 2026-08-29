@@ -1578,6 +1578,27 @@ function renderAliases(aliases) {
 }
 
 /* ── Init ──────────────────────────────────────────────────── */
+async function loadBuild() {
+  // Which image is actually answering — the quickest way to notice a container
+  // still running a stale tag after a deploy. /health needs no key, so this
+  // works before signing in.
+  const chip = $("#build");
+  try {
+    const res = await fetch("/health");
+    if (!res.ok) return;
+    const d = await res.json();
+    if (!d.version) return;
+    chip.textContent = d.version;
+    chip.classList.toggle("release", !!d.release);
+    chip.title = d.revision
+      ? `build ${d.version} · commit ${d.revision}`
+      : `build ${d.version} — not a CI build`;
+    chip.hidden = false;
+  } catch {
+    /* console still works without it; leave the chip hidden */
+  }
+}
+
 function initKey() {
   $("#api-key").value = getKey();
   const save = () => {
@@ -1617,6 +1638,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#routing-refresh").addEventListener("click", loadRouting);
   $("#cfg-refresh").addEventListener("click", loadConfig);
 
+  loadBuild();
   loadLogFlags();
   activateTab("logging");
 });

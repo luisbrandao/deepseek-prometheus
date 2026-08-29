@@ -189,7 +189,10 @@ def test_console_paths_redirect_rather_than_401(client, path):
 
 
 def test_health_needs_no_key(client):
-    assert client.get("/health").json() == {"status": "ok"}
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    # The build fields are covered in tests/test_version.py; what matters here is
+    # that /health answers at all without a key.
 
 
 def test_metrics_uses_the_llm_proxy_prefix(client):
