@@ -835,7 +835,10 @@ async function cfgSave(path, method, body, what) {
 function renderConfig() {
   $("#cfg-path").textContent = cfg.path || "";
   const w = $("#cfg-writable");
-  if (cfg.writable) {
+  if (cfg.detached) {
+    w.textContent = "file detached — saves would be lost on restart";
+    w.style.color = "var(--red)";
+  } else if (cfg.writable) {
     w.textContent = "file: writable";
     w.style.color = "";
   } else {
@@ -844,12 +847,34 @@ function renderConfig() {
   }
   const body = $("#cfg-body");
   body.innerHTML = "";
+  if (cfg.detached) body.appendChild(detachedBanner());
   body.appendChild(cfgUpstreamSection());
   body.appendChild(cfgGroupsSection());
   body.appendChild(cfgAliasSection());
 }
 
-const cfgDisabled = () => !cfg.writable;
+const cfgDisabled = () => !cfg.writable || !!cfg.detached;
+
+// The failure this exists for is silent by construction: the container keeps
+// reading back its own writes, so everything looks saved right up until a restart
+// throws the lot away. Loud, and every Save is disabled while it holds.
+function detachedBanner() {
+  const box = el("div", "cfgdetached");
+  box.appendChild(el("div", "cfgdetachedhead", "⚠  This config file is detached — do not edit"));
+  const p1 = el("p", "cfghelpline");
+  p1.append(document.createTextNode(
+    "The file was replaced on the host while this container was running — a "),
+    code("git pull"), document.createTextNode(", "), code("git checkout"),
+    document.createTextNode(", or an editor that saves by writing a new file and "
+      + "renaming it over the old one (vim does this by default). The container is "
+      + "still holding the old copy, so anything saved here would look fine and then "
+      + "disappear the moment the container restarts."));
+  const p2 = el("p", "cfghelpline");
+  p2.append(document.createTextNode("Re-bind it on the host, then reload this page:"));
+  const pre = el("pre", "flbodytext", "docker compose up -d --force-recreate llm-proxy");
+  box.append(p1, p2, pre);
+  return box;
+}
 
 /* ── Upstream models per provider ─────────────────────────── */
 function cfgUpstreamSection() {

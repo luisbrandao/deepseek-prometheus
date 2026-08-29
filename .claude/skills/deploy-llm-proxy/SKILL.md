@@ -37,10 +37,33 @@ involved, and the image tag is a build counter you must *read*, never guess.
   `paths-ignore: ['**.md']`, so a push touching only `.md` files produces no run,
   no new tag, and nothing to deploy. Say so and stop rather than hunting for a
   tag that will never exist.
-- Deploying only *config* (`monitoring/llmproxy.yaml`)? Skip steps 1–2 entirely.
-  The proxy polls its config file and hot-reloads it (`CONFIG_RELOAD_INTERVAL`),
-  so a config-only change needs a commit+push and the file in place — **no image
-  bump and no container restart**.
+- Deploying only *config* (`monitoring/llmproxy.yaml`)? Skip steps 1–2 entirely —
+  no image bump. But you **must still recreate the container**; see the warning
+  below. The hot-reload only helps if the container is still looking at the file
+  you edited.
+
+> ### ⚠ Pulling a config change detaches the mount
+>
+> `monitoring/llmproxy.yaml` is a **single-file** bind mount, so it is pinned to
+> one inode. `git pull` / `checkout` / rebase do not edit files in place — they
+> write a new file and rename it over the old one. The instant that happens, a
+> running container is holding an **orphaned inode**: it keeps reading and
+> writing its own private copy, the console reports every save as successful, and
+> the whole lot vanishes when the container is next recreated. This has already
+> destroyed a session of console edits (2026-08-29).
+>
+> `docker compose up -d` will **not** save you: with no image change it sees
+> nothing to do and leaves the stale container running. After any pull that
+> touched `llmproxy.yaml`:
+>
+> ```bash
+> docker compose up -d --force-recreate llm-proxy
+> ```
+>
+> The proxy now detects this itself — `/admin/config` reports `detached: true`,
+> the Config tab shows a red "do not edit" banner and disables saving, and every
+> write is refused with the recreate command. If you see that banner, this is why.
+> The permanent fix is to mount the containing *directory* instead of the file.
 
 ## 1. Commit and push the app
 
@@ -129,7 +152,8 @@ cd ~/docker/monitoring ; docker compose up -d
 
 `docker compose up -d` recreates only the services whose definition changed, so
 the rest of the monitoring stack (Prometheus, Loki, dcgm-exporter, …) is left
-alone.
+alone. That is also why it is not enough on its own when the *config* moved and
+the image did not — use `--force-recreate llm-proxy` there.
 
 **If `git pull` conflicts on `llmproxy.yaml`:** you edited the config locally
 *and* someone reordered priorities in the production console. gw's version is

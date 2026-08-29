@@ -86,6 +86,34 @@ def config_writable() -> bool:
     return os.access(conf.CONFIG_PATH, os.W_OK)
 
 
+def config_detached() -> bool:
+    """True when the config file has been unlinked from its directory — i.e. this
+    process is holding an orphaned inode and **nothing it writes is visible outside
+    the container**.
+
+    `/app/config.yaml` is a *single-file* bind mount, so the mount is pinned to one
+    inode. Anything that replaces the host file by rename rather than writing it in
+    place — `git pull`/`checkout`/rebase, `vim` with its default backupcopy, most
+    "atomic save" editors — leaves the container mounted on the old inode. The
+    directory entry is gone, so `st_nlink` drops to 0, but the file stays alive
+    because the mount holds it open.
+
+    That state is silent and vicious: reads and writes keep working, a write reads
+    back exactly as written (same inode), so every self-check here passes — and the
+    moment the container is recreated the whole lot disappears. It has already cost
+    a session's worth of console edits. So it is checked before every write, and
+    surfaced in the console.
+
+    The fix is on the host: recreate the container (`docker compose up -d
+    --force-recreate llm-proxy`) to re-bind to the current file, or mount the
+    containing *directory* instead of the file so renames are visible.
+    """
+    try:
+        return os.stat(conf.CONFIG_PATH).st_nlink == 0
+    except OSError:
+        return False
+
+
 def _read_text() -> str:
     with open(conf.CONFIG_PATH, "r", encoding="utf-8") as f:
         return f.read()
@@ -161,6 +189,14 @@ def _commit(doc, before_text: str, check):
     if problem:
         return False, problem
 
+    if config_detached():
+        return False, (
+            "refusing to write: the config file has been replaced on the host "
+            "(git pull/checkout, or an editor that saves by rename), so this "
+            "container is holding an orphaned copy and nothing written here would "
+            "survive a restart. Recreate the container to re-bind it: "
+            "docker compose up -d --force-recreate llm-proxy"
+        )
     if not config_writable():
         return False, "config file is not writable (read-only mount?)"
     try:

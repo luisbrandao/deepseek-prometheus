@@ -444,6 +444,14 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 
 .btn.tiny { padding: 4px 9px; font-size: 12px; }
 
+.cfgdetached {
+  margin-bottom: 18px; padding: 14px 16px; max-width: 92ch;
+  background: rgba(229,96,77,.08); border: 1px solid rgba(229,96,77,.5);
+  border-left: 3px solid var(--red); border-radius: 8px;
+}
+.cfgdetachedhead { font-weight: 700; color: #ffb9af; margin-bottom: 8px; font-size: 13.5px; }
+.cfgdetached .flbodytext { margin-top: 8px; }
+
 /* Section heading + its (?) panel */
 .cfgheadwrap { margin-bottom: 10px; }
 .cfgheadwrap h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 0; }

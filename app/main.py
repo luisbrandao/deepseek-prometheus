@@ -533,6 +533,10 @@ def _config_snapshot() -> dict:
     return {
         "path": conf.CONFIG_PATH,
         "writable": configwrite.config_writable(),
+        # True when the host file was replaced under a running container, so
+        # anything saved here would vanish on the next restart. See
+        # configwrite.config_detached — it is silent without this flag.
+        "detached": configwrite.config_detached(),
         "providers": [
             _provider_view(p, editable=True, fronted=fronted) for p in conf.PROVIDERS
         ],
@@ -731,6 +735,7 @@ async def admin_routing(request: Request):
     return {
         "auto_group": conf.ROUTING.auto_group,
         "config_writable": configwrite.config_writable(),
+        "config_detached": configwrite.config_detached(),
         "providers": providers,
         "logical_models": logical_models,
         "aliases": conf.ALIASES,

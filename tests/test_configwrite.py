@@ -8,6 +8,9 @@ in place silently discards all of that. The symptom was a save that changed
 nothing rewriting `"a": "b"` as `a: b` and flattening block lists into flow — a
 diff on a hand-annotated, git-tracked production file, produced by a no-op.
 """
+import os
+from pathlib import Path
+
 import pytest
 
 from app import configwrite
@@ -205,3 +208,46 @@ async def test_priority_reorder_reports_a_mismatch_instead_of_raising(cfg):
     assert isinstance(err, str) and err
     # The reason names the target it could not account for, rather than blowing up.
     assert "beta" in err
+
+
+async def test_detached_config_is_detected_and_refused(cfg, tmp_path):
+    """A replaced-by-rename config file must be spotted, not written to.
+
+    This is the failure that cost a live session's worth of console edits. A
+    single-file bind mount is pinned to one inode; `git pull`/`checkout` and
+    editors that save by rename replace the *host* file, leaving the container on
+    an orphaned inode. Everything keeps working — the write succeeds, reads back
+    byte-for-byte, every self-check passes — and the edits evaporate the next time
+    the container is recreated.
+
+    Simulated here the same way it happens for real: rename a different file over
+    the config path while the original inode is still reachable. `st_nlink` on the
+    orphan drops to 0, which is the only signal available from inside.
+    """
+    from app import config as conf
+
+    path = Path(conf.CONFIG_PATH)
+    assert configwrite.config_detached() is False
+
+    # Hold the original inode open so it survives losing its directory entry,
+    # exactly as the bind mount does.
+    with open(path, "rb") as pinned:
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text("providers: []\n")
+        os.replace(replacement, path)  # rename over it — the orphaning step
+
+        # The test process reaches the orphan through /proc/self/fd, the way the
+        # container reaches it through its mount point.
+        orphan = f"/proc/self/fd/{pinned.fileno()}"
+        assert os.stat(orphan).st_nlink == 0, "the orphan should have lost its name"
+
+        conf.CONFIG_PATH = orphan
+        assert configwrite.config_detached() is True
+
+        ok, err = await configwrite.set_aliases({"anything": "at-all"})
+        assert ok is False
+        assert "detached" in err or "replaced on the host" in err
+        # And it says how to fix it, since the reader is looking at a console.
+        assert "force-recreate" in err
+
+        conf.CONFIG_PATH = str(path)
