@@ -99,6 +99,17 @@ A run appears a few seconds after the push and takes **~20–35s** to finish. If
 `gh run list` still shows the previous run, wait and re-poll — do not assume it
 was skipped. Confirm `headSha` matches the commit you just pushed.
 
+> **If the build fails**, read `gh run view <databaseId> --log-failed` before
+> touching anything. The tests run first, and everything in `requirements*.txt`
+> is a `>=` floor, so CI installs whatever shipped this morning while the local
+> checkout may be months older: a collection error naming a `DeprecationWarning`
+> from *third-party* code is dependency drift, not the change (run 56 failed this
+> way the day anyio 4.15 came out, via `error::DeprecationWarning` in
+> `pytest.ini`). Reproduce with CI's versions rather than guessing:
+> `python3.11 -m venv v && v/bin/pip install -r requirements-dev.txt && v/bin/pytest -q`.
+> Fix, push, and read the tag again — the failed run kept its number, so the
+> image you deploy is `master-<N+1>`, and the gap is permanent.
+
 The tag to deploy is `master-<number>` from that run. Verify it really landed in
 the registry before editing anything (the package is private, so this needs a
 token):
