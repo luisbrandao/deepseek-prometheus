@@ -481,7 +481,7 @@ function renderFlight(data) {
 function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
-    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.estimated,
+    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.estimated, r.tps,
     r.client_host, r.has_body, killSent.has(r.id),
     JSON.stringify(bodyOpen.get(r.id) || null),
   ].join("\u0001");
@@ -557,17 +557,33 @@ function fillFlightRow(row, r) {
   const tokOut = r.out_tokens == null
     ? (r.live ? "0" : "—")
     : (r.estimated ? "~" + r.out_tokens : String(r.out_tokens));
+  // Tokens per second over the upstream exchange — the same figure the request
+  // log emits as speed_tps (in_tps for embeddings/rerankers, which generate
+  // nothing). Queue wait is excluded; prompt processing is not, because the
+  // clock starts when the request is sent, so a fresh stream reads 0.0 until the
+  // first token lands. On a live row it is the average so far, over the
+  // estimated count, hence the ~. Two decimals, like the log line, so the two
+  // read as the same number instead of one that looks rounded.
+  const tps = r.tps == null
+    ? (r.state === "running" ? "0.00" : "—")
+    : (r.estimated ? "~" : "") + r.tps.toFixed(2);
+  const tpsCell = timeCell("tok/s", tps);
+  tpsCell.title = (r.op ? "input" : "output") + " tokens per second of upstream time"
+    + " — queue wait excluded" + (r.live ? "; average so far" : "")
+    + " (the request log's " + (r.op ? "in_tps" : "speed_tps") + ")";
   if (r.live) {
     times.appendChild(timeCell("age", dur(r.age)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
     times.appendChild(timeCell("running", dur(r.running_for)));
     times.appendChild(timeCell("tok in", tokIn));
     times.appendChild(timeCell("tok out", tokOut));
+    times.appendChild(tpsCell);
   } else {
     times.appendChild(timeCell("took", dur(r.duration)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
     times.appendChild(timeCell("tok in", tokIn));
     times.appendChild(timeCell("tok out", tokOut));
+    times.appendChild(tpsCell);
   }
   times.appendChild(timeCell("chunks", r.stream ? String(r.chunks == null ? "—" : r.chunks) : "—"));
   times.appendChild(timeCell("body", bytes(r.req_bytes)));

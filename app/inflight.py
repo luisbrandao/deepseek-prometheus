@@ -28,7 +28,7 @@ Lifecycle — exactly one owner closes each entry, mirroring the slot lifecycle:
     proxy.proxy_request   begin()             state=queued, registered
     proxy._dispatch       Entry.wait(targets) state=queued  (re-armed per attempt)
                           Entry.run(target)   state=running (slot acquired)
-    both handlers         Entry.record(...)   outcome: status + token counts
+    both handlers         Entry.record(...)   outcome: status, token counts, upstream time
     non-stream            proxy.proxy_request closes it — the buffered Response
                           is complete by the time the handler returns
     stream                proxy._handle_stream's generator `finally` closes it,
@@ -74,7 +74,7 @@ class Entry:
         "method", "path", "req_bytes", "client_ip", "svc", "provider",
         "native_model", "candidates", "attempt", "slot_at", "chunks",
         "task", "stream_task", "cancelled", "status", "in_tokens", "out_tokens",
-        "skipped", "estimated",
+        "skipped", "estimated", "upstream_secs",
     )
 
     def __init__(self, model, stream, op, method, path, req_bytes, client_ip, svc):
@@ -115,6 +115,11 @@ class Entry:
         # True while out_tokens is our own live count rather than the upstream's
         # reported usage, so the console can render it as approximate.
         self.estimated = False
+        # How long the upstream exchange took, as measured by the handler and
+        # handed to `record` — the very number the request log divides by for
+        # `speed_tps`. None until the response is complete; until then the
+        # tokens/s shown is computed against `slot_at`, live.
+        self.upstream_secs = None
 
     def wait(self, targets) -> None:
         """Waiting for a slot: the initial admission, or a re-queue after a
@@ -135,6 +140,9 @@ class Entry:
         self.native_model = native_model
         self.slot_at = time.monotonic()
         self.attempt += 1
+        # A failover starts a new exchange: the failed attempt's measured time
+        # must not be divided into this attempt's tokens.
+        self.upstream_secs = None
 
     def passed_over(self) -> None:
         """Model affinity let a later request go first. Surfaced on the queued row
@@ -160,7 +168,8 @@ class Entry:
         self.out_tokens = (self.out_tokens or 0) + 1
         self.estimated = True
 
-    def record(self, status: int, in_tokens: int = 0, out_tokens: int = 0) -> None:
+    def record(self, status: int, in_tokens: int = 0, out_tokens: int = 0,
+               duration: Optional[float] = None) -> None:
         """Note the outcome, from whichever handler saw the upstream response.
 
         Called before `finish`, so the history row carries the real status and
@@ -171,8 +180,15 @@ class Entry:
         something. A backend that never sends usage reports 0 here, and zeroing a
         count we watched tick up would be strictly worse information, so a 0 keeps
         the estimate (and its flag).
+
+        `duration` is the handler's own measurement of the upstream exchange, the
+        value the request log divides by. Taking it here rather than reading a
+        second clock means the row's tokens/s and the log's `speed_tps` are one
+        number, not two that drift by however long the bookkeeping took.
         """
         self.status = status
+        if duration is not None:
+            self.upstream_secs = duration
         if in_tokens:
             self.in_tokens = in_tokens
         if out_tokens:
@@ -276,6 +292,32 @@ class Entry:
         })
         _recent.appendleft(row)
 
+    def tps(self, now: float) -> Optional[float]:
+        """Tokens per second over the upstream exchange, or None when there is
+        nothing to divide — the figure the request log emits as `speed_tps`
+        (`in_tps` for a no-output op, since an embedding generates nothing).
+
+        The denominator is time on the wire, never time since arrival: a request
+        that waited a minute for a slot did not generate slowly. It does include
+        prompt processing, because the clock starts when the request is sent, not
+        at the first token — so a fresh stream reads 0 until tokens land, exactly
+        as the log's number would. While the row is live this is the average so
+        far, over our own estimated count (`estimated` tells the console to mark
+        it `~`); once `record` has the handler's measured duration that is used
+        verbatim, so the history row agrees with the log line.
+        """
+        tokens = self.in_tokens if self.op else self.out_tokens
+        if not tokens:
+            return None
+        secs = self.upstream_secs
+        if secs is None:
+            if self.slot_at is None:
+                return None
+            secs = now - self.slot_at
+        if secs <= 0:
+            return None
+        return round(tokens / secs, 2)
+
     def as_dict(self, now: float) -> dict:
         return {
             "id": self.id,
@@ -306,6 +348,9 @@ class Entry:
             "in_tokens": self.in_tokens,
             "out_tokens": self.out_tokens,
             "estimated": self.estimated,
+            # Tokens/s over upstream time (see `tps`); None while there is
+            # nothing to divide, which the console renders as a dash.
+            "tps": self.tps(now),
             "has_body": self.id in _bodies,
             "cancelled": self.cancelled,
             "client_ip": self.client_ip,

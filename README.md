@@ -422,6 +422,13 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     `~40`, and is replaced by the authoritative number the instant usage arrives. `tok in`
     is genuinely unknowable before then and reads `0`. A buffered (non-streaming) request
     reveals nothing until it returns, so both read `0` while it runs.
+  - **`tok/s`** is the same figure the request log emits as `speed_tps`: output tokens over
+    the time the upstream exchange took — queue wait excluded, prompt processing included,
+    because the clock starts when the request is sent rather than at the first token. A
+    running row shows the average so far (over the `~` estimate, so it carries a `~` too)
+    and reads `0.00` until the first token lands; a finished row shows the final number,
+    computed from the very duration the log line used. Embeddings and rerankers generate
+    nothing, so their `tok/s` is input tokens/s, as in the log's `in_tps`.
   - A **finished** row is frozen at completion with its status, total time, queue wait and
     token counts (`done` / `cancelled` / `failed`, colour-coded). History is capped by
     `INFLIGHT_HISTORY` and is lost on restart by design — the durable per-request record is

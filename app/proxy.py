@@ -389,7 +389,7 @@ async def _handle_non_stream(
             _record_metrics(pname, model, in_tokens, out_tokens, duration)
 
     if entry is not None:
-        entry.record(status_code, in_tokens, out_tokens)
+        entry.record(status_code, in_tokens, out_tokens, duration)
         entry.add_response(resp_body)
 
     return Response(
@@ -554,7 +554,7 @@ async def _handle_stream(
             # the history row carries the outcome and not just "it ended".
             duration = time.time() - start
             if entry is not None:
-                entry.record(status_code, in_tokens, out_tokens)
+                entry.record(status_code, in_tokens, out_tokens, duration)
                 entry.finish()
             # Closes the response and returns its connection to the shared
             # pool. The client is process-wide — never aclose() it here.

@@ -13,6 +13,7 @@ stops draining its queue.
 import json
 import json as _json
 import logging
+import re
 
 import httpx
 import pytest
@@ -211,6 +212,23 @@ def test_token_counts_reach_the_log(client, upstreams, events):
     assert "in=42" in line and "out=13" in line
 
 
+def test_history_row_tokens_per_second_is_the_logged_number(client, upstreams, events):
+    """The In-flight tab's tok/s and the request log's speed_tps must be one
+    number: the row takes the handler's measured duration rather than running a
+    clock of its own, so the two cannot drift apart."""
+    upstreams.set(lambda r: mock_response(200, json=completion(prompt=42, out=13)))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    logged = float(re.search(r"speed_tps=(\S+)", line).group(1))
+    row = client.get("/admin/inflight").json()["requests"][0]
+    assert row["live"] is False and row["out_tokens"] == 13
+    assert row["tps"] == logged > 0
+    # Every field fillFlightRow dereferences for its number cells — the console
+    # is untyped, so a dropped one is a blank cell, not an error.
+    assert {"tps", "estimated", "in_tokens", "out_tokens", "duration", "queued_for",
+            "running_for", "chunks", "req_bytes"} <= set(row)
+
+
 # ── Failover ────────────────────────────────────────────────────────────────
 
 def test_retryable_status_fails_over_to_the_next_target(client, upstreams):
@@ -339,6 +357,19 @@ def test_stream_records_usage_in_the_log(client, upstreams, events):
     assert "in=5" in line and "out=2" in line
     assert "stream=true" in line
     assert "asked=grouped" in line
+
+
+def test_stream_history_row_tokens_per_second_is_the_logged_number(client, upstreams, events):
+    upstreams.set(lambda r: mock_response(
+        200, content=SSE, headers={"content-type": "text/event-stream"}
+    ))
+    client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
+    line = next(l for l in events() if "event=request" in l)
+    logged = float(re.search(r"speed_tps=(\S+)", line).group(1))
+    row = client.get("/admin/inflight").json()["requests"][0]
+    # The reported usage replaced the live estimate, so no ~ on the history row.
+    assert row["out_tokens"] == 2 and row["estimated"] is False
+    assert row["tps"] == logged > 0
 
 
 def test_stream_error_before_first_byte_fails_over(client, upstreams):
