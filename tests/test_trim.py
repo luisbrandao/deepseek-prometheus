@@ -19,7 +19,8 @@ def body(payload):
 
 
 def run(payload):
-    return trim.trim_request(payload, body(payload), payload.get("model"))
+    res = trim.trim_request(payload, body(payload), payload.get("model"))
+    return None if res is None else res.payload
 
 
 def msg(role, text, **extra):
@@ -142,6 +143,17 @@ def test_the_newest_turn_is_kept_even_when_it_alone_is_over_budget(cfg, caplog):
     assert [m["role"] for m in out["messages"]] == ["system", "assistant"]
     assert out["messages"][-1] == p["messages"][-1]
     assert "STILL over budget" in caplog.text
+
+
+def test_result_carries_the_numbers_the_row_and_log_show(cfg):
+    cfg()
+    p = convo(20, num_ctx=2000)
+    res = trim.trim_request(p, body(p), "m", request_id=7)
+    assert res.dropped == len(p["messages"]) - len(res.payload["messages"]) > 0
+    assert res.capped == 0
+    assert res.before > res.budget == 2000 >= res.after
+    assert res.as_dict() == {"dropped": res.dropped, "capped": 0, "before": res.before,
+                             "after": res.after, "budget": 2000}
 
 
 # ── Tool calls stay paired ───────────────────────────────────────────────────

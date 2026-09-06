@@ -159,7 +159,7 @@ def _chat(num_ctx, turns=30):
     return {"model": "grouped", "num_ctx": num_ctx, "messages": messages}
 
 
-def test_oversized_conversation_is_trimmed_before_forwarding(client, upstreams, caplog):
+def test_oversized_conversation_is_trimmed_before_forwarding(client, upstreams, caplog, events):
     r = client.post("/v1/chat/completions", json=_chat(num_ctx=5000))
     assert r.status_code == 200
     sent = upstreams.body(upstreams.requests[0])
@@ -167,8 +167,23 @@ def test_oversized_conversation_is_trimmed_before_forwarding(client, upstreams, 
     assert sent["messages"][0]["role"] == "system"
     assert sent["messages"][-1]["content"].startswith("a29 ")
     assert 1 < len(sent["messages"]) < 61
-    assert "Trimmed request for 'grouped'" in caplog.text
+    dropped = 61 - len(sent["messages"])
+    # Three places say the same thing: the WARNING, the event line, the feed row.
+    assert re.search(rf"CONTEXT TRIM request #\d+ model 'grouped'.*dropped {dropped} of 61", caplog.text)
+    line = next(l for l in events() if "event=request" in l)
+    assert f"trimmed={dropped}" in line and "trim_capped=0" in line
+    row = client.get("/admin/inflight", headers={"Authorization": "Bearer test-key"}).json()["requests"][0]
+    assert row["trimmed"]["dropped"] == dropped
+    assert row["trimmed"]["after"] <= row["trimmed"]["budget"] == 1000
     assert idle() == {"first": 0, "second": 0}
+
+
+def test_untrimmed_request_carries_no_trim_fields(client, upstreams, events):
+    client.post("/v1/chat/completions", json=_chat(num_ctx=128000, turns=3))
+    line = next(l for l in events() if "event=request" in l)
+    assert "trimmed=" not in line
+    row = client.get("/admin/inflight", headers={"Authorization": "Bearer test-key"}).json()["requests"][0]
+    assert row["trimmed"] is None
 
 
 def test_fitting_conversation_is_forwarded_byte_for_byte(client, upstreams):

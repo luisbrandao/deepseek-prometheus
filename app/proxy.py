@@ -171,7 +171,7 @@ def _op_kind(path: str, model: str):
 async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
     in_tokens: int, out_tokens: int, duration: float, stream: bool,
-    asked: Optional[str] = None,
+    asked: Optional[str] = None, trimmed: Optional[dict] = None,
 ) -> None:
     """Emit the single, always-on, parseable line summarizing one request.
 
@@ -194,6 +194,10 @@ async def _emit_request_log(
     A model-less passthrough (non-chat / multipart body, nothing to resolve) is
     logged as `event=passthrough` keyed by request path — never as a bogus
     `model=unknown`, which would pollute the per-model view.
+
+    `trimmed` is what the context guardrail did to this request (app/trim.py),
+    emitted as `trimmed=<messages dropped>` and `trim_capped=<tool results cut>`
+    so a trimmed request is greppable in Loki; absent when nothing was trimmed.
     """
     ip = clientinfo.client_ip(request)
     host = await clientinfo.client_host(ip)
@@ -235,6 +239,8 @@ async def _emit_request_log(
             "dur": str(timedelta(seconds=math.ceil(duration))),
             "speed_tps": None if op else f"{out_tokens / duration if duration > 0 else 0:.2f}",
             "in_tps": f"{in_tokens / duration if duration > 0 else 0:.2f}" if op else None,
+            "trimmed": trimmed["dropped"] if trimmed else None,
+            "trim_capped": trimmed["capped"] if trimmed else None,
         })
     fields.update({
         "client_ip": ip,
@@ -335,6 +341,7 @@ async def _handle_non_stream(
     # The name the client sent, for the log's `asked=` field. The in-flight entry
     # already carries it, so nothing extra has to be threaded down here.
     asked = entry.model if entry is not None else None
+    trimmed = entry.trimmed if entry is not None else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -398,7 +405,7 @@ async def _handle_non_stream(
         headers=_relay_headers(resp_headers),
         background=BackgroundTask(
             _emit_request_log, request, pname, model, status_code,
-            in_tokens, out_tokens, duration, False, asked,
+            in_tokens, out_tokens, duration, False, asked, trimmed,
         ),
     )
 
@@ -413,6 +420,7 @@ async def _handle_stream(
     pname = provider.name
     # See _handle_non_stream: the client-facing name for the log's `asked=` field.
     asked = entry.model if entry is not None else None
+    trimmed = entry.trimmed if entry is not None else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -470,7 +478,7 @@ async def _handle_stream(
             headers=_relay_headers(resp_headers),
             background=BackgroundTask(
                 _emit_request_log, request, pname, model, status_code, 0, 0, 0.0,
-                True, asked,
+                True, asked, trimmed,
             ),
         )
 
@@ -568,7 +576,7 @@ async def _handle_stream(
                     _record_metrics(pname, model, in_tokens, out_tokens, duration)
             await _emit_request_log(
                 request, pname, model, status_code, in_tokens, out_tokens, duration,
-                True, asked,
+                True, asked, trimmed,
             )
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
@@ -925,8 +933,9 @@ async def _route(
     # Context guardrail: a conversation the client says cannot fit (`num_ctx`)
     # is shrunk once here, before any target is chosen, so every failover
     # attempt forwards the same trimmed body. Fits → `payload` is untouched.
-    trimmed = trim.trim_request(payload, body_str, raw_model)
+    trimmed = trim.trim_request(payload, body_str, raw_model, entry.id)
     if trimmed is not None:
-        payload = trimmed
+        payload = trimmed.payload
+        entry.mark_trimmed(trimmed.as_dict())
 
     return await _dispatch(request, path, payload, is_stream, candidates, entry)

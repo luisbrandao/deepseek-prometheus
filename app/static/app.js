@@ -481,7 +481,8 @@ function renderFlight(data) {
 function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
-    r.provider, r.attempt, r.skipped, r.in_tokens, r.out_tokens, r.estimated, r.tps,
+    r.provider, r.attempt, r.skipped, JSON.stringify(r.trimmed || null),
+    r.in_tokens, r.out_tokens, r.estimated, r.tps,
     r.client_host, r.has_body, killSent.has(r.id),
     JSON.stringify(bodyOpen.get(r.id) || null),
   ].join("\u0001");
@@ -521,6 +522,19 @@ function fillFlightRow(row, r) {
     sk.title = "the backend already had another request's model loaded, so that one "
       + "went first — this is capped, see routing.affinity_max_skips";
     line1.appendChild(sk);
+  }
+  if (r.trimmed) {
+    // The context guardrail shrank this request (see trim: in the config).
+    const t = r.trimmed;
+    const label = t.dropped
+      ? "trimmed " + t.dropped + " msg" + (t.dropped === 1 ? "" : "s")
+      : "trimmed " + t.capped + " tool result" + (t.capped === 1 ? "" : "s");
+    const tr = el("span", "fltag warn", label);
+    tr.title = "conversation exceeded the num_ctx it declared: ~" + t.before
+      + " tokens vs a budget of " + t.budget + " — dropped " + t.dropped
+      + " oldest message(s), cut " + t.capped + " old tool result(s) to an excerpt, forwarded ~"
+      + t.after + " tokens" + (t.after > t.budget ? " (still over: the newest turn alone does not fit)" : "");
+    line1.appendChild(tr);
   }
   if (r.status != null && r.status >= 400) {
     line1.appendChild(el("span", "fltag bad", "HTTP " + r.status));

@@ -195,9 +195,11 @@ a little early; under-counting forwards exactly the request this exists to stop.
 towards 4 for mostly-English chats if it trims too eagerly. Non-text content parts
 (images) count a flat ~1000 tokens each rather than their base64 length.
 
-Every trim logs one `WARNING` line with the estimate, the budget, how many tool results
-were excerpted and how many messages were dropped, and increments
-`llm_proxy_trims_total{model}` (keyed by the name the client sent). Turn it off with
+Every trim shows up in three places with the same numbers: a `CONTEXT TRIM request #N …`
+`WARNING` with the estimate, the budget, messages dropped and tool results excerpted; the
+request's `event=request` line gains `trimmed=<dropped> trim_capped=<excerpted>`; and the
+In-flight row carries a `trimmed N msgs` badge. `llm_proxy_trims_total{model}` counts them
+(keyed by the name the client sent). Turn it off with
 `trim.enabled: false`; like the rest of `config.yaml` it hot-reloads.
 
 ### Upstream timeouts and connection reuse
@@ -478,6 +480,10 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     the `event=request` log line.
   - Every row shows who called (service from the `User-Agent`, plus IP and reverse-DNS name)
     and the request body size.
+  - Badges on the first line flag what happened to a request on the way through:
+    `attempt 2` (failed over), `passed over N×` (queue affinity), and **`trimmed N msgs`**
+    when the [context guardrail](#context-guardrail) dropped history — hover it for the
+    token estimate against the budget and how many tool results were excerpted.
   - **Body** expands the row to show the prompt this request sent and the reply that came
     back — pretty-printed, with a thinking model's reasoning kept separate from its answer.
     On a running request the reply fills in as it streams. This is the reason it exists:
@@ -679,6 +685,7 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
 | `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
+| `trimmed`, `trim_capped` | Present only when the [context guardrail](#context-guardrail) shrank the request: messages dropped and old tool results cut to an excerpt. `{trimmed!=""}` in Loki finds every trimmed request; the matching `CONTEXT TRIM request #N …` WARNING has the token estimates |
 
 An **embedding or rerank** request returns no completion tokens (`out=0`), so it's tagged
 `op=embedding` / `op=rerank` and reports `in_tps` (input tokens/s) in place of `speed_tps` —
@@ -817,7 +824,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-200 tests, no network, about a second. They exist to pin the properties that
+202 tests, no network, about a second. They exist to pin the properties that
 are invisible in review: that every acquired slot is released on every exit path
 (including timeout and cancellation), that two identical config saves leave the
 file byte-identical, that an unknown model 404s instead of being routed to an

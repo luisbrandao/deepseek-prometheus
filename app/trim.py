@@ -36,6 +36,7 @@ rather than by their base64 length, which would otherwise dwarf everything.
 import json
 import logging
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from app import config as conf
@@ -49,6 +50,22 @@ logger = logging.getLogger("llm-proxy")
 MEDIA_PART_TOKENS = 1000
 
 TRUNCATION_MARK = "\n\n…[llm-proxy cut {n} characters from the middle of this tool result]…\n\n"
+
+
+@dataclass
+class Trimmed:
+    """What a trim did — the payload to forward plus the numbers the request
+    log and the In-flight row surface, so the same figures appear in both."""
+    payload: dict
+    dropped: int      # messages removed
+    capped: int       # tool results cut to an excerpt
+    before: int       # estimated tokens on arrival
+    after: int        # estimated tokens forwarded
+    budget: int       # num_ctx - response_headroom
+
+    def as_dict(self) -> dict:
+        return {"dropped": self.dropped, "capped": self.capped, "before": self.before,
+                "after": self.after, "budget": self.budget}
 
 
 def _chars(obj) -> int:
@@ -130,11 +147,15 @@ def _blocks(indices: List[int], messages: List[dict]) -> List[List[int]]:
     return blocks
 
 
-def trim_request(payload: dict, body_str: str, asked: Optional[str]) -> Optional[dict]:
-    """Return a trimmed copy of `payload`, or None when it needs no change.
+def trim_request(
+    payload: dict, body_str: str, asked: Optional[str], request_id: Optional[int] = None
+) -> Optional[Trimmed]:
+    """Return the trimmed copy of `payload` with what was done to it, or None
+    when it needs no change (the caller then forwards the original, untouched).
 
     `body_str` is the raw request body, used as a free upper bound: a body whose
-    total length already fits the budget is never even inspected.
+    total length already fits the budget is never even inspected. `request_id`
+    is the In-flight id, so the log line can be matched to its row.
     """
     t = conf.TRIM
     if not t.enabled:
@@ -193,13 +214,13 @@ def trim_request(payload: dict, body_str: str, asked: Optional[str]) -> Optional
 
     TRIMS_TOTAL.labels(model=asked or "unknown").inc()
     logger.warning(
-        "Trimmed request for '%s': estimated %d tokens > budget %d "
-        "(num_ctx=%d - headroom %d); capped %d old tool result(s), dropped %d of %d "
-        "message(s), now ~%d tokens%s",
-        asked, before, budget, num_ctx, t.response_headroom, capped, dropped,
-        len(messages), after,
+        "CONTEXT TRIM request #%s model '%s': estimated %d tokens > budget %d "
+        "(num_ctx=%d - headroom %d) -> dropped %d of %d message(s), cut %d old tool "
+        "result(s) to an excerpt, forwarding ~%d tokens%s",
+        request_id if request_id is not None else "?", asked, before, budget, num_ctx,
+        t.response_headroom, dropped, len(messages), capped, after,
         "" if after <= budget else " — STILL over budget, the newest turn alone does not fit",
     )
     out = dict(payload)
     out["messages"] = new_messages
-    return out
+    return Trimmed(out, dropped, capped, before, after, budget)
