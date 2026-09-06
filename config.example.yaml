@@ -147,3 +147,21 @@ routing:
   # to the next target (a connection failure always does). 4xx like 400/404 are
   # relayed as-is — every backend would reject them the same way. Default below.
   failover_statuses: [429, 500, 502, 503, 504]
+
+# Context guardrail (see README "Context guardrail"). Acts only on a chat body
+# that carries an integer `num_ctx` (Open WebUI sends the model's configured
+# context size) AND is estimated to exceed `num_ctx - response_headroom`. Then,
+# in order: old oversized tool results are cut to a head+tail excerpt; the
+# oldest turns are dropped (system messages always kept, a tool call and its
+# results go together); the newest turn is always sent. A request that fits is
+# forwarded untouched. Every trim logs a WARNING and counts in
+# llm_proxy_trims_total{model}.
+trim:
+  enabled: true
+  # Token estimate = serialized JSON chars / chars_per_token. 3 over-counts on
+  # purpose — trimming a little early beats forwarding a 512 KB conversation to
+  # a paid backend. Raise towards 4 for mostly-English chats if it is too eager.
+  chars_per_token: 3.0
+  response_headroom: 4000       # tokens kept free below num_ctx for the reply
+  max_tool_result_tokens: 4000  # tool results above this (and old) are excerpted; 0 = never
+  protect_recent: 10            # the newest N messages are never excerpted

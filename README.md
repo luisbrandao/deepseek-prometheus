@@ -167,6 +167,39 @@ client gets the last upstream error verbatim (its real status and body), not a s
 502. Streaming requests can fail over up to the first byte (after that the HTTP status is
 already committed).
 
+### Context guardrail
+
+A chat client sends the *whole* conversation on every turn. When its own history
+management fails, a 512 KB chat goes to a paid backend verbatim — a large bill for a
+reply the model cannot ground in a context that size. The proxy is the last hop, so it
+enforces the limit the client itself declares.
+
+It acts only when **all** of these hold: the body is a JSON chat with a `messages` list,
+it carries an integer `num_ctx` (Open WebUI sends the model's configured context size
+this way), and the estimated size exceeds `num_ctx - response_headroom`. A request that
+fits — or has no `num_ctx` — is forwarded untouched, byte for byte. Then, in order:
+
+1. **Excerpt old, oversized tool results.** A `role: tool` message deeper than
+   `protect_recent` messages from the end and above `max_tool_result_tokens` is cut to a
+   head + tail excerpt with a `…[llm-proxy cut N characters…]…` marker. One 20 KB
+   `fetch_url` dump buried in history should not force every older turn out.
+2. **Drop the oldest turns** until the rest fits. System messages are always kept. An
+   assistant message that calls tools and the `tool` results answering it are one block,
+   so the window never starts on a dangling call (which most backends reject with a 400).
+3. **Always send the newest turn**, even when it alone is over budget: there is nothing
+   smaller to send, and the backend's own error is the right answer. The log says so.
+
+Sizes are estimated as serialized JSON characters divided by `chars_per_token` — no
+tokenizer, no network. The default of 3 is deliberately conservative: over-counting trims
+a little early; under-counting forwards exactly the request this exists to stop. Raise it
+towards 4 for mostly-English chats if it trims too eagerly. Non-text content parts
+(images) count a flat ~1000 tokens each rather than their base64 length.
+
+Every trim logs one `WARNING` line with the estimate, the budget, how many tool results
+were excerpted and how many messages were dropped, and increments
+`llm_proxy_trims_total{model}` (keyed by the name the client sent). Turn it off with
+`trim.enabled: false`; like the rest of `config.yaml` it hot-reloads.
+
 ### Upstream timeouts and connection reuse
 
 All outbound calls share one pooled `httpx` client (`app/upstream.py`), so a request to
@@ -260,6 +293,14 @@ routing:
   auto_group: true    # identical canonical names across backends load-balance
   down_backoff: 15    # seconds a failed backend is skipped before retry
   failover_statuses: [429, 500, 502, 503, 504]  # upstream statuses that fail over
+
+# Context guardrail: shrink a chat that cannot fit the `num_ctx` it declares.
+trim:
+  enabled: true
+  chars_per_token: 3.0        # token estimate = JSON chars / this (conservative)
+  response_headroom: 4000     # tokens kept free below num_ctx for the reply
+  max_tool_result_tokens: 4000  # old tool results above this are excerpted first
+  protect_recent: 10          # the newest N messages are never excerpted
 ```
 
 ### Provider fields
@@ -323,6 +364,8 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   an entry.
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
   `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above).
+- **`trim:`** — the context guardrail: `enabled`, `chars_per_token`, `response_headroom`,
+  `max_tool_result_tokens`, `protect_recent` (see [Context guardrail](#context-guardrail)).
 
 ### Environment variables
 
@@ -582,6 +625,7 @@ Scrape `http://<host>:8000/metrics`:
 | `llm_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
 | `llm_proxy_queue_affinity_grants_total` | Counter | `provider` | Times the queue admitted a request ahead of an earlier one to avoid a model swap |
 | `llm_proxy_queue_starvation_yields_total` | Counter | `provider` | Times `affinity_max_skips` forced FIFO to unblock a passed-over request |
+| `llm_proxy_trims_total` | Counter | `model` | Requests whose conversation was shrunk to fit the `num_ctx` they declared (see [Context guardrail](#context-guardrail)) |
 
 > **Metric prefix:** as of the multi-backend rework these use `llm_proxy_` (was
 > `deepseek_proxy_`). Update existing Grafana/alert queries accordingly.
@@ -773,7 +817,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-106 tests, no network, well under a second. They exist to pin the properties that
+200 tests, no network, about a second. They exist to pin the properties that
 are invisible in review: that every acquired slot is released on every exit path
 (including timeout and cancellation), that two identical config saves leave the
 file byte-identical, that an unknown model 404s instead of being routed to an

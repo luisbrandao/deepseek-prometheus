@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, clientinfo, inflight, registry, router, slots, upstream
+from app import auth, clientinfo, inflight, registry, router, slots, trim, upstream
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -921,5 +921,12 @@ async def _route(
     # Prefer backends not currently marked down, but keep them as a last resort.
     healthy = [t for t in targets if not registry.is_down(t.provider)]
     candidates = healthy or targets
+
+    # Context guardrail: a conversation the client says cannot fit (`num_ctx`)
+    # is shrunk once here, before any target is chosen, so every failover
+    # attempt forwards the same trimmed body. Fits → `payload` is untouched.
+    trimmed = trim.trim_request(payload, body_str, raw_model)
+    if trimmed is not None:
+        payload = trimmed
 
     return await _dispatch(request, path, payload, is_stream, candidates, entry)

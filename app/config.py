@@ -160,6 +160,27 @@ class Routing:
     )
 
 
+@dataclass
+class Trim:
+    """The context-window guardrail (see app/trim.py). Global, not per backend:
+    it keys off the `num_ctx` the *client* sends, which is the client's
+    statement of the model's context size whatever backend serves it."""
+    enabled: bool = True
+    # Token estimate = serialized chars / this. 3 is conservative on purpose:
+    # over-counting trims a little early, under-counting forwards the very
+    # request this guards against. Raise towards 4 for mostly-English chats.
+    chars_per_token: float = 3.0
+    # Tokens kept free below num_ctx for the reply and anything the backend
+    # injects. The budget is `num_ctx - response_headroom`.
+    response_headroom: int = 4000
+    # A `tool` result older than `protect_recent` messages and above this many
+    # tokens is cut to a head+tail excerpt before any turn is dropped. 0 disables.
+    max_tool_result_tokens: int = 4000
+    # The newest N messages are never excerpted; the current answer usually
+    # depends on them verbatim.
+    protect_recent: int = 10
+
+
 def _read_config() -> bytes:
     with open(CONFIG_PATH, "rb") as f:
         return f.read()
@@ -229,6 +250,15 @@ def _load(text: bytes):
         ),
     )
 
+    tr = raw.get("trim") or {}
+    trim = Trim(
+        enabled=bool(tr.get("enabled", True)),
+        chars_per_token=max(0.5, float(tr.get("chars_per_token", 3.0))),
+        response_headroom=max(0, int(tr.get("response_headroom", 4000))),
+        max_tool_result_tokens=max(0, int(tr.get("max_tool_result_tokens", 4000))),
+        protect_recent=max(0, int(tr.get("protect_recent", 10))),
+    )
+
     # Accepted proxy keys gate the `require_permission` backends. Sourced from
     # the PROXY_API_KEYS env var (comma-separated) and/or `auth.keys` in config
     # (which supports ${ENV_VAR} interpolation). Empty => gate disabled.
@@ -242,7 +272,7 @@ def _load(text: bytes):
         if k:
             auth_keys.add(k)
 
-    return providers, aliases, logical, routing, auth_keys
+    return providers, aliases, logical, routing, auth_keys, trim
 
 
 def _boot():
@@ -255,7 +285,7 @@ def _boot():
     return _load(text)
 
 
-PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS = _boot()
+PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM = _boot()
 PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
 
 
@@ -277,7 +307,7 @@ def reload_if_changed() -> bool:
     parsed (and logged by the caller) once, not on every tick; the next real
     edit triggers a retry.
     """
-    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, PROVIDERS_BY_NAME
+    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, PROVIDERS_BY_NAME
     global _last_sig, _loaded_digest
     sig = _stat_sig()
     if sig == _last_sig:
@@ -287,12 +317,13 @@ def reload_if_changed() -> bool:
     digest = hashlib.sha256(text).hexdigest()
     if digest == _loaded_digest:
         return False
-    providers, aliases, logical, routing, auth_keys = _load(text)
+    providers, aliases, logical, routing, auth_keys, trim = _load(text)
     PROVIDERS = providers
     ALIASES = aliases
     LOGICAL_MODELS = logical
     ROUTING = routing
     AUTH_KEYS = auth_keys
+    TRIM = trim
     PROVIDERS_BY_NAME = {p.name: p for p in providers}
     _loaded_digest = digest
     return True

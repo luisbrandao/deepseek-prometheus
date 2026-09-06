@@ -149,6 +149,54 @@ def idle():
     return {name: slots.in_use(name) for name in ("first", "second")}
 
 
+# ── Context guardrail ───────────────────────────────────────────────────────
+
+def _chat(num_ctx, turns=30):
+    messages = [{"role": "system", "content": "S" * 200}]
+    for i in range(turns):
+        messages.append({"role": "user", "content": f"u{i} " + "x" * 300})
+        messages.append({"role": "assistant", "content": f"a{i} " + "y" * 300})
+    return {"model": "grouped", "num_ctx": num_ctx, "messages": messages}
+
+
+def test_oversized_conversation_is_trimmed_before_forwarding(client, upstreams, caplog):
+    r = client.post("/v1/chat/completions", json=_chat(num_ctx=5000))
+    assert r.status_code == 200
+    sent = upstreams.body(upstreams.requests[0])
+    assert sent["model"] == "vendor/First-Native"
+    assert sent["messages"][0]["role"] == "system"
+    assert sent["messages"][-1]["content"].startswith("a29 ")
+    assert 1 < len(sent["messages"]) < 61
+    assert "Trimmed request for 'grouped'" in caplog.text
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_fitting_conversation_is_forwarded_byte_for_byte(client, upstreams):
+    payload = _chat(num_ctx=128000, turns=3)
+    client.post("/v1/chat/completions", json=payload)
+    sent = upstreams.body(upstreams.requests[0])
+    assert sent["messages"] == payload["messages"]
+    assert sent["num_ctx"] == 128000
+
+
+def test_failover_forwards_the_same_trimmed_body(client, upstreams):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if upstreams.host(request) == "first.invalid":
+            return mock_response(503, json={"error": "busy"})
+        return mock_response(200, json=completion())
+
+    upstreams.set(handler)
+    r = client.post("/v1/chat/completions", json=_chat(num_ctx=5000))
+    assert r.status_code == 200
+    first, second = (upstreams.body(q) for q in upstreams.requests[:2])
+    assert first["messages"] == second["messages"]
+    assert len(first["messages"]) < 61
+    assert idle() == {"first": 0, "second": 0}
+
+
 # ── Happy path ──────────────────────────────────────────────────────────────
 
 def test_request_reaches_the_best_priority_backend(client, upstreams):

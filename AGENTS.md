@@ -22,6 +22,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
+| `app/trim.py` | The context guardrail: `trim_request(payload, body_str, asked)` returns a shrunk copy of a chat body that declares `num_ctx` and is estimated to exceed it, or `None` when nothing needs to change. Excerpts old oversized tool results first, then drops the oldest turns at tool-call block boundaries; system messages always survive. Configured by the `trim:` section (`conf.TRIM`). Called once per request in `proxy._route`, before `_dispatch`. |
 | `app/version.py` | Build identity — `VERSION` (the image tag, e.g. `master-52`), `REVISION` (git sha), `summary()`, `as_dict()`. Read from `APP_VERSION`/`APP_REVISION` at import; baked in by the Dockerfile from CI build-args. **Not** hot-reloaded — it is build metadata, not config. |
 | `app/upstream.py` | The two shared `httpx.AsyncClient`s and their timeouts. Everything outbound goes through here so connections are pooled; `FORWARD_TIMEOUT` is long-read/short-connect on purpose. Closed by `main`'s lifespan. |
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
@@ -38,7 +39,10 @@ decompresses the response. Single process, async, one uvicorn worker.
 3. `router.resolve(model)` → ordered targets.
 4. Gate: if unauthorized, drop `require_permission` targets; none left → **401**.
 5. Drop currently-down targets (keep as last resort).
-6. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
+6. `trim.trim_request` — the context guardrail. Only touches a body with `messages` + an
+   integer `num_ctx` that is estimated to exceed it; anything else passes through untouched.
+   Runs once, before any target is chosen, so every failover attempt forwards the same body.
+7. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
 
 ## Layering
 
@@ -50,7 +54,7 @@ main.py                        ASGI entry: routes, /admin router, lifespan
   └─ proxy.py                  request lifecycle, failover
        └─ router.py            name -> ordered targets
             └─ registry.py     discovery + health
-  registry · slots · inflight · auth · clientinfo · configwrite     services
+  registry · slots · inflight · auth · clientinfo · configwrite · trim     services
        └─ config.py            the leaf everything reads
   config.py · metrics.py · logbuffer.py · upstream.py · version.py   leaves
 ```
@@ -266,6 +270,17 @@ independent rules. If you add process-local state, add it to the reset list in
   `APP_VERSION` changes every build, and an `ARG` above the install would invalidate that
   layer every time. An undefined `ARG` expands to `""`, not to nothing, which is why
   `version.py` treats blank as absent and reports `dev`.
+- **The context guardrail must be a no-op for anything it was not built for.** `trim`
+  acts only on a JSON chat body with a `messages` list *and* an integer `num_ctx`, and
+  only when the estimate exceeds the budget; every other body — no `num_ctx`, a fitting
+  chat, embeddings, a malformed `messages` — must come back as `None` so `_route`
+  forwards the client's bytes unchanged. A client that manages its own context is never
+  second-guessed. When it does act: system messages are never dropped, an assistant
+  `tool_calls` message and its `tool` results are kept or dropped together (a dangling
+  call is a 400 at most backends), and the newest block is always sent even when it alone
+  is over budget. It reads `num_ctx` *before* `_build_body` applies `strip_fields`, so a
+  Google target that strips the field still gets the trimmed conversation. Read it as
+  `conf.TRIM` at call time — it hot-reloads like everything else.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
 - **Never persist or re-seed the counters.** A restart resetting them to zero is a real
   counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
@@ -314,6 +329,7 @@ one:
 | `tests/test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` carries them, and `llm_proxy_build_info` is exposed. |
 | `tests/test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and that `api_key` never appears in a response. |
 | `tests/test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped with no build step, so a dropped field shows up as a blank cell rather than an error. |
+| `tests/test_trim.py` | The context guardrail is a no-op unless `num_ctx` is present and exceeded (a fitting body returns `None`, not a copy); system messages survive; the oldest turns go first; a tool call and its results are never separated at the cut (swept across budgets); old oversized tool results are excerpted before any turn is dropped while recent ones stay whole; the newest turn is always sent; images are counted flat; the `trim:` section parses and hot-reloads. `test_proxy.py` covers the wire: a trimmed body reaches the backend, a fitting one is forwarded verbatim, and a failover re-sends the same trimmed body. |
 | `tests/test_inflight.py` | The feed's derived numbers, driven on `Entry` directly: tokens/s divides over upstream time (queue wait excluded), takes the handler's recorded duration over the clock, is reset by a failover, keeps the `~` estimate when a backend never reports usage, and rounds exactly as the log formats. `test_proxy.py` closes the loop by matching a history row to its `speed_tps` line. |
 
 Conventions that matter when adding tests:

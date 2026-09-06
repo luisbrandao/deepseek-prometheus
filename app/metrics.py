@@ -79,6 +79,13 @@ FAILOVERS_TOTAL = Counter(
     ["provider"],
 )
 
+TRIMS_TOTAL = Counter(
+    "llm_proxy_trims_total",
+    "Requests whose conversation was shrunk to fit the num_ctx they declared "
+    "(see the trim: config section)",
+    ["model"],
+)
+
 # NOTE: these counters are deliberately NOT persisted across restarts. A restart
 # resets them to zero, which Prometheus recognises as a counter reset and handles
 # correctly in rate()/increase(). Re-seeding them from a snapshot is what breaks
